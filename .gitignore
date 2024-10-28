@@ -1,0 +1,7 @@
+.env
+ca_pers_env/**/*
+ca_pers_env
+ca_pers_env/bin
+./ca_pers_env/bin/*
+.vscode
+final_embeddings.pkl
