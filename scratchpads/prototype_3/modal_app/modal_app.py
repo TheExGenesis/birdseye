@@ -18,10 +18,12 @@
 import shlex
 import subprocess
 from pathlib import Path
+from typing import List, Tuple
 import modal
 import sys
 import json
 from .lib.label_clusters import (
+    LABEL_CLUSTER_PROMPT,
     get_cluster_tweet_texts,
     label_all_clusters,
     label_cluster,
@@ -29,11 +31,13 @@ from .lib.label_clusters import (
     query_anthropic_model,
     extract_special_tokens,
     parse_extracted_data,
+    curry,
 )
 from .lib.get_tweets import (
     check_and_process_tweets,
     patch_tweets_with_note_tweets,
     create_tweets_df,
+    process_tweets,
 )
 import json
 import socket
@@ -45,7 +49,14 @@ from tqdm import tqdm
 import numpy as np
 import asyncio
 import httpx
-
+from .lib.const import (
+    get_user_paths,
+    TWEETS_DF_SCHEMA,
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    CLUSTERED_TWEETS_DF_SCHEMA,
+)
+import toolz as tz
 
 # Configure GPU and model constants
 GPU_CONFIG = modal.gpu.T4()
@@ -71,6 +82,11 @@ image = modal.Image.debian_slim(python_version="3.11").pip_install(
 # Import supabase only inside the container where it's installed
 with image.imports():
     from supabase import create_client
+    import anthropic
+    from anthropic.types.beta.message_create_params import (
+        MessageCreateParamsNonStreaming,
+    )
+    from anthropic.types.beta.messages.batch_create_params import Request
     import pandas as pd
     import logging
     import pickle
@@ -83,6 +99,22 @@ with image.imports():
     import seaborn as sns
     import time
     import numpy as np
+    from .lib.ontological_label_lib import (
+        make_cluster_str,
+        tfidf_label_clusters,
+        group_clusters,
+        label_with_ontology,
+        validate_ontology_results,
+    )
+    from .lib.prompts import (
+        ONTOLOGY_LABEL_CLUSTER_PROMPT,
+        ONTOLOGY_GROUP_PROMPT,
+        group_ontology,
+        ontology,
+    )
+    import pyarrow as pa
+    import toolz as tz
+
 
 # Create persistent volume for data
 volume = modal.Volume.from_name("twitter-archive-data", create_if_missing=True)
@@ -170,6 +202,7 @@ with rapids_image.imports():
     import sys
     import re
     from collections import defaultdict, deque
+    import pyarrow as pa
     from tqdm import tqdm
     import re
     import seaborn as sns
@@ -211,143 +244,44 @@ class TextEmbeddingsInference:
                     raise e  # Raise the last exception if all retries fail
 
 
-@app.function(image=image, volumes={"/twitter_data": volume}, timeout=600)
-def process_archive(username: str, force_recompute: bool = False):
-    volume.reload()
-    # Set up paths
-    data_dir = Path("/twitter_data")
-    user_dir = data_dir / username
-    user_dir.mkdir(exist_ok=True)
-    processed_path = user_dir / "convo_tweets_tweets_df.parquet"
-
-    # Check if processed file exists and we're not forcing recompute
-    if processed_path.exists() and not force_recompute:
-        print(f"Found cached processed tweets for {username}")
-        df = pd.read_parquet(processed_path)
-        return {
-            "username": username,
-            "tweet_count": df.shape[0],
-            "trees_count": None,
-            "incomplete_trees_count": None,
-            "source": "cache",
-        }
-
-    SUPABASE_URL = "https://fabxmporizzqflnftavs.supabase.co"
-    SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYnhtcG9yaXp6cWZsbmZ0YXZzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MjIyNDQ5MTIsImV4cCI6MjAzNzgyMDkxMn0.UIEJiUNkLsW28tBHmG-RQDW-I5JNlJLt62CSk9D_qG8"
-
+@app.function(image=image, volumes={"/twitter-archive-data": volume}, timeout=600)
+def process_archive_data(archive: dict, username: str) -> dict:
+    """Process archive data and return processed dataframe and stats"""
+    # Extract username and accountId from archive if not provided
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # Use volume path for data storage
-    data_dir = Path("/twitter_data")
-    user_dir = data_dir / username
-    user_dir.mkdir(exist_ok=True)
-
-    archive_path = user_dir / "archive.json"
-
-    print(f"Attempting to download archive for {username}")
-
-    # Download from Supabase with better error handling
-    try:
-        # First check if file exists
-        bucket = supabase.storage.from_("archives")
-        files = bucket.list(f"{username}/")
-        print(f"Files in bucket for {username}:", files)
-
-        # Try download
-        print(f"Downloading from path: {username}/archive.json")
-        res = bucket.download(f"{username}/archive.json")
-
-        print(f"Download successful, writing {len(res)} bytes")
-        with open(archive_path, "wb") as f:
-            f.write(res)
-
-    except Exception as e:
-        print(f"Error downloading archive: {str(e)}")
-        print(f"Error type: {type(e)}")
-        raise e
-
-    # Load and verify archive
-    try:
-        with open(archive_path) as f:
-            archive = json.load(f)
-        tweet_count = len(archive["tweets"])
-
-    except Exception as e:
-        raise e
-
-    patched_tweets = patch_tweets_with_note_tweets(
-        archive.get("note-tweet", []), archive["tweets"]
-    )
-    print(f"Patched {len(patched_tweets)} tweets")
-
-    username = archive["account"][0]["account"]["username"]
-    accountId = archive["account"][0]["account"]["accountId"]
-
-    print(f"Creating tweets dataframe for user {username}")
-
-    tweets_df = create_tweets_df(patched_tweets, username, accountId)
-    # filter df to tweets after 01-2019
-    if username == "exgenesis":
-        tweets_df = tweets_df[
-            tweets_df["created_at"] > pd.Timestamp("2019-01-01", tz="UTC")
-        ]
-
-    procesed_tweets_df, trees, incomplete_trees = check_and_process_tweets(
-        supabase, tweets_df, user_dir / "convo_tweets"
+    processed_tweets_df, trees, incomplete_trees = process_tweets(
+        supabase, archive, username, include_date=False
     )
 
-    # Save processed tweets to correct path
-    processed_path = user_dir / "convo_tweets_tweets_df.parquet"
-    procesed_tweets_df.to_parquet(processed_path)
-
-    volume.commit()
-
-    # Return stats before embedding
     return {
-        "username": username,
-        "tweet_count": procesed_tweets_df.shape[0],
-        "trees_count": len(trees),
-        "incomplete_trees_count": len(incomplete_trees),
-        "source": "computed",
+        "tweets_df": processed_tweets_df,
+        "trees": trees,
+        "incomplete_trees": incomplete_trees,
+        "stats": {
+            "username": username,
+            "tweet_count": processed_tweets_df.shape[0],
+            "trees_count": len(trees),
+            "incomplete_trees_count": len(incomplete_trees),
+        },
     }
 
 
-@app.function(
-    # gpu=GPU_CONFIG,
-    image=image,
-    concurrency_limit=2,
-    allow_concurrent_inputs=10,
-    volumes={"/twitter_data": volume},
-    timeout=600,
-)
-def embed_tweets(username: str, force_recompute: bool = False):
-    data_dir = Path("/twitter_data")
-    user_dir = data_dir / username
-    embeddings_path = user_dir / "convo_tweets_embeddings.npy"
+def download_archive(username: str):
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    bucket = supabase.storage.from_("archives")
+    res = bucket.download(f"{username}/archive.json")
+    return res
 
-    volume.reload()
 
-    # Check if embeddings exist and we're not forcing recompute
-    if embeddings_path.exists() and not force_recompute:
-        embeddings = np.load(embeddings_path)
-        return {"embedded_tweets": len(embeddings), "source": "cache"}
-
-    df_path = user_dir / "convo_tweets_tweets_df.parquet"
-
-    # Check if embeddings already exist
-    if embeddings_path.exists():
-        embeddings = np.load(embeddings_path)
-        return {"embedded_tweets": len(embeddings), "source": "cache"}
-
-    # Load and process tweets
-    df = pd.read_parquet(df_path)
-    texts = df["emb_text"].tolist()
-
+@app.function(image=image, timeout=600)
+def compute_embeddings(texts: list[str]) -> np.ndarray:
+    """Compute embeddings for a list of texts"""
     # Initialize embedder and process in batches
     embedder = TextEmbeddingsInference()
     embeddings = []
 
-    # Create batches for tqdm
+    # Create batches
     batches = [texts[i : i + BATCH_SIZE] for i in range(0, len(texts), BATCH_SIZE)]
 
     print(f"Starting embeddings for {len(texts)} texts")
@@ -355,97 +289,237 @@ def embed_tweets(username: str, force_recompute: bool = False):
     for batch_embedding in batch_embeddings:
         embeddings.extend(batch_embedding)
 
-    # Convert to numpy array and save
-    embeddings = np.array(embeddings)
-    temp_path = embeddings_path.with_suffix(".tmp.npy")
-    try:
-        print(f"Saving {len(embeddings)} embeddings to temporary file")
-        np.save(temp_path, embeddings)
+    # Convert to numpy array
+    return np.array(embeddings)
 
-        # Atomic rename
-        temp_path.rename(embeddings_path)
-        print(f"Successfully saved embeddings to {embeddings_path}")
 
-    except Exception as e:
-        print(f"Error saving embeddings: {e}")
-        if temp_path.exists():
-            temp_path.unlink()
-        raise
+@app.function(gpu="T4", image=rapids_image, timeout=600)
+def reduce_dimensions(
+    embeddings: np.ndarray, n_components: int = 5
+) -> tuple[np.ndarray, float]:
+    """Reduces dimensionality of embeddings using UMAP
+
+    Args:
+        embeddings: Input embeddings array
+        n_components: Number of dimensions to reduce to
+
+    Returns:
+        tuple of (reduced embeddings array, time taken in seconds)
+    """
+    print("Running UMAP dimension reduction...")
+    start_time = time.time()
+
+    reducer = cuml.manifold.UMAP(n_components=n_components)
+    reduced_embeddings = reducer.fit_transform(embeddings)
+
+    reduction_time = time.time() - start_time
+    print(f"UMAP reduction completed in {reduction_time:.2f} seconds")
+
+    return reduced_embeddings, reduction_time
+
+
+@app.function(image=image, volumes={"/twitter-archive-data": volume}, timeout=600)
+def cluster_tweets(username: str, force_recompute: bool = False):
+    """Handles caching and I/O for tweet clustering"""
+    print(f"Starting clustering for {username}")
+    data_dir = Path("/twitter-archive-data")
+    user_dir = data_dir / username
+
+    # Define paths
+    paths = get_user_paths(username)
+
+    volume.reload()
+
+    clustered_tweets_df = pd.read_parquet(paths["tweets_df"])
+    # Get reduced embeddings
+    if paths["reduced_embeddings"].exists() and not force_recompute:
+        print("Loading cached reduced embeddings...")
+        reduced_embeddings = np.load(paths["reduced_embeddings"])
+        umap_time = 0
+    else:
+        # Load embeddings and tweets
+        print("Loading embeddings and tweets...")
+        embeddings = np.load(paths["embeddings"])
+        print(f"Loaded embeddings {embeddings.shape}")
+        # Reduce dimensions with UMAP
+        reduced_embeddings, umap_time = reduce_dimensions.remote(
+            embeddings, n_components=5
+        )
+        np.save(paths["reduced_embeddings"], reduced_embeddings)
+
+    # Check for cached clustering results
+    if (
+        all(
+            paths[p].exists()
+            for p in [
+                "cluster_ontology_items",
+                "cluster_probs",
+                "soft_clusters",
+                "clustered_tweets_df",
+            ]
+        )
+        and not force_recompute
+    ):
+        print("Loading cached clustering results...")
+        cluster_results = {
+            "labels": np.load(paths["cluster_labels_arr"]),
+            "probabilities": np.load(paths["cluster_probs"]),
+            "soft_clusters": np.load(paths["soft_clusters"]),
+            "timing": 0,
+            "soft_clustering_time": 0,
+        }
+        # Calculate stats from cached data
+        cluster_labels = cluster_results["labels"].astype(str)
+        cluster_results["n_clusters"] = len(
+            np.unique(cluster_labels[cluster_labels != "-1"])
+        )
+        cluster_results["n_noise"] = sum(cluster_labels == "-1")
+    else:
+        reduced_embeddings, umap_time = reduce_dimensions.remote(
+            embeddings, n_components=5
+        )
+        # Run clustering pipeline
+        min_cluster_size = max(
+            5, min(100, int(reduced_embeddings.shape[0] * 0.001) + 1)
+        )
+        min_samples = min_cluster_size
+        cluster_results = cluster_tweet_embeddings.remote(
+            reduced_embeddings, min_cluster_size, min_samples
+        )
+
+        # Save clustering results
+        np.save(paths["cluster_labels_arr"], cluster_results["labels"])
+        np.save(paths["cluster_probs"], cluster_results["probabilities"])
+        np.save(paths["soft_clusters"], cluster_results["soft_clusters"])
+
+        # Update and save dataframe
+        clustered_tweets_df["cluster"] = cluster_results["labels"]
+        clustered_tweets_df["cluster_prob"] = cluster_results["probabilities"]
+
+        # Ensure IDs are strings
+        clustered_tweets_df["tweet_id"] = clustered_tweets_df["tweet_id"].astype(str)
+        clustered_tweets_df["accountId"] = clustered_tweets_df["accountId"].astype(str)
+        clustered_tweets_df["reply_to_tweet_id"] = clustered_tweets_df[
+            "reply_to_tweet_id"
+        ].astype(str)
+        clustered_tweets_df["reply_to_user_id"] = clustered_tweets_df[
+            "reply_to_user_id"
+        ].astype(str)
+
+        print(clustered_tweets_df.columns)
+        print(clustered_tweets_df)
+        if pd.api.types.is_datetime64_any_dtype(clustered_tweets_df["created_at"]):
+            clustered_tweets_df["created_at"] = clustered_tweets_df[
+                "created_at"
+            ].dt.strftime("%Y-%m-%d %H:%M:%S%z")
+        clustered_tweets_df["retweet_count"] = clustered_tweets_df[
+            "retweet_count"
+        ].astype("int64")
+        clustered_tweets_df["favorite_count"] = clustered_tweets_df[
+            "favorite_count"
+        ].astype("int64")
+        # Define schema for tweets_df
+        # Convert datetime to string format
+        clustered_tweets_df.to_parquet(
+            paths["clustered_tweets_df"], schema=CLUSTERED_TWEETS_DF_SCHEMA
+        )
+
+    # Check for cached hierarchy results
+    if paths["hierarchy"].exists() and not force_recompute:
+        print("Loading cached hierarchy results...")
+        hierarchy_df = pd.read_parquet(paths["hierarchy"])
+        hierarchy_results = {
+            "hierarchy_df": hierarchy_df,
+            "n_clusters": len(hierarchy_df[hierarchy_df["level"] == 1]),
+            "n_noise": len(hierarchy_df[hierarchy_df["parent"] == "-1"]),
+            "timing": 0,
+        }
+    else:
+        # Run centroid clustering
+        hierarchy_results = cluster_centroids.remote(
+            reduced_embeddings, cluster_results["labels"]
+        )
+
+        # Save results
+
+        # Save hierarchy with schema
+        schema = pa.schema(
+            [
+                ("cluster_id", pa.string()),
+                ("parent", pa.string()),
+                ("level", pa.int64()),
+            ]
+        )
+
+        hierarchy_results["hierarchy_df"].to_parquet(paths["hierarchy"], schema=schema)
+    print(hierarchy_results["hierarchy_df"])
 
     volume.commit()
 
-    return {"embedded_tweets": len(embeddings), "source": "computed"}
+    return {
+        "base_clusters": {
+            "n_clusters": cluster_results["n_clusters"],
+            "n_noise": cluster_results["n_noise"],
+        },
+        "parent_clusters": {
+            "n_clusters": hierarchy_results["n_clusters"],
+            "n_noise": hierarchy_results["n_noise"],
+        },
+        "timing": {
+            "umap": umap_time,
+            "clustering": cluster_results["timing"],
+            "soft_clustering": cluster_results["soft_clustering_time"],
+            "hierarchy": hierarchy_results["timing"],
+        },
+    }
 
 
-# @app.function(image=rapids_image, volumes={"/twitter_data": volume}, timeout=600)
-@app.function(
-    gpu="T4", image=rapids_image, volumes={"/twitter_data": volume}, timeout=600
-)
-def cluster_tweets(username: str, force_recompute: bool = False):
-    print(f"Starting clustering for {username}")
-    data_dir = Path("/twitter_data")
-    user_dir = data_dir / username
-    embeddings_path = user_dir / "convo_tweets_embeddings.npy"
-    reduced_embeddings_path = user_dir / "reduced_embeddings.npy"
-    clusterer_path = user_dir / "clusterer.pkl"
-    clusters_path = user_dir / "clusters.json"
-    df_path = user_dir / "convo_tweets_tweets_df.parquet"
-
-    volume.reload()
-    # Load embeddings and tweets df
-    print("Loading embeddings and tweets...")
-    embeddings = np.load(embeddings_path)
-    df = pd.read_parquet(df_path)
-    print(f"Loaded embeddings {embeddings.shape}")
-
-    # Try to load reduced embeddings first if not forcing recompute
-    if reduced_embeddings_path.exists() and not force_recompute:
-        print("Loading cached reduced embeddings...")
-        reduced_embeddings = np.load(reduced_embeddings_path)
-        umap_time = 0
-        print("Loaded reduced embeddings from cache")
-    else:
-        # Reduce dimensions with UMAP if not cached
-        print("Running UMAP dimension reduction...")
-        start_time = time.time()
-        reducer = cuml.manifold.UMAP(n_components=5)
-        reduced_embeddings = reducer.fit_transform(embeddings)
-        umap_time = time.time() - start_time
-        print(f"UMAP reduction completed in {umap_time:.2f} seconds")
-
-        # Save reduced embeddings
-        print("Saving reduced embeddings...")
-        np.save(reduced_embeddings_path, reduced_embeddings)
-
-    # Run HDBSCAN clustering
+@app.function(gpu="T4", image=rapids_image, timeout=600)
+def cluster_tweet_embeddings(
+    reduced_embeddings: np.ndarray, min_cluster_size: int = 15, min_samples: int = 15
+):
+    """Clusters tweet embeddings using HDBSCAN"""
     print("Running HDBSCAN clustering...")
     start_time = time.time()
     clusterer = cuml.cluster.hdbscan.HDBSCAN(
-        min_cluster_size=15, min_samples=15, metric="euclidean", prediction_data=True
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric="euclidean",
+        prediction_data=True,
     )
     clusterer.fit(reduced_embeddings)
+
     clustering_time = time.time() - start_time
-    print(
-        f"HDBSCAN clustering completed in {clustering_time:.2f} seconds, {clusterer.labels_.shape} labels"
-    )
-    cluster_labels = clusterer.labels_
-    print(f"Cluster labels int: {cluster_labels.shape}")
-    cluster_labels = clusterer.labels_.astype(str)
-    print(f"Cluster labels str: {cluster_labels.shape}")
-    cluster_probs = clusterer.probabilities_
+    print(f"HDBSCAN clustering completed in {clustering_time:.2f} seconds")
 
     # Get cluster assignments and probabilities
     print("Computing soft clusters...")
-    start_time = time.time()
+    soft_start = time.time()
     soft_clusters = cuml.cluster.hdbscan.all_points_membership_vectors(clusterer)
-    soft_clustering_time = time.time() - start_time
-    print(f"Soft clustering completed in {soft_clustering_time:.2f} seconds")
+    soft_clustering_time = time.time() - soft_start
 
-    # Get cluster centroids
+    cluster_labels = clusterer.labels_.astype(str)
+    base_n_clusters = len(np.unique(cluster_labels[cluster_labels != "-1"]))
+    base_n_noise = sum(cluster_labels == "-1")
+
+    return {
+        "labels": cluster_labels,
+        "probabilities": clusterer.probabilities_,
+        "soft_clusters": soft_clusters,
+        "n_clusters": base_n_clusters,
+        "n_noise": base_n_noise,
+        "timing": clustering_time,
+        "soft_clustering_time": soft_clustering_time,
+    }
+
+
+@app.function(gpu="T4", image=rapids_image, timeout=600)
+def cluster_centroids(reduced_embeddings: np.ndarray, cluster_labels: np.ndarray):
+    """Clusters the centroids of the base clusters"""
     print("Computing cluster centroids...")
     start_time = time.time()
 
-    # Compute centroids
+    # Get unique non-noise labels and compute centroids
     unique_labels = np.unique(cluster_labels[cluster_labels != "-1"])
     centroids = np.array(
         [
@@ -453,6 +527,7 @@ def cluster_tweets(username: str, force_recompute: bool = False):
             for label in unique_labels
         ]
     )
+
     # Cluster the centroids
     centroid_clusterer = cuml.cluster.hdbscan.HDBSCAN(
         min_cluster_size=3,
@@ -462,54 +537,400 @@ def cluster_tweets(username: str, force_recompute: bool = False):
         cluster_selection_method="leaf",
     )
     centroid_clusterer.fit(centroids)
-
-    # Convert group_labels to string
     group_labels = centroid_clusterer.labels_.astype(str)
-    print(f"Group labels: {group_labels.shape}, {group_labels}")
 
-    # Create hierarchy dataframe with string parent
+    # Create hierarchy dataframe
     hierarchy_df = pd.DataFrame(
         {
             "cluster_id": unique_labels,
             "parent": [(f"1-{l}" if l != "-1" else "-1") for l in group_labels],
-            "level": 0,  # All base clusters are level 0
+            "level": 0,
         }
     )
 
-    # Add parent clusters (level 1) with parent as string
+    # Add parent clusters
     parent_clusters = pd.DataFrame(
         {
             "cluster_id": [
-                f"{1}-{i}" for i in np.unique([l for l in group_labels if l != "-1"])
+                f"1-{i}" for i in np.unique([l for l in group_labels if l != "-1"])
             ],
-            "parent": "-1",  # Changed to string
+            "parent": "-1",
             "level": 1,
         }
     )
 
     hierarchy_df = pd.concat([hierarchy_df, parent_clusters], ignore_index=True)
 
-    print("After clustering, hierarchy")
-    print(hierarchy_df)
-
-    # Get cluster assignments and stats for base clusters (level 0)
-    base_n_clusters = len(np.unique(cluster_labels[cluster_labels != "-1"]))
-    base_n_noise = sum(cluster_labels == "-1")
-
-    # Get stats for parent clusters (level 1)
     parent_n_clusters = len(np.unique(group_labels[group_labels != "-1"]))
     parent_n_noise = sum(group_labels == "-1")
 
-    print(f"Found {base_n_clusters} base clusters with {base_n_noise} noise points")
-    print(
-        f"Grouped into {parent_n_clusters} parent clusters with {parent_n_noise} ungrouped clusters"
+    hierarchy_time = time.time() - start_time
+
+    return {
+        "hierarchy_df": hierarchy_df,
+        "n_clusters": parent_n_clusters,
+        "n_noise": parent_n_noise,
+        "timing": hierarchy_time,
+    }
+
+
+from toolz import keyfilter
+
+
+def pick(allowlist, d):
+    return keyfilter(lambda k: k in allowlist, d)
+
+
+# Create error result object
+def make_error_result(
+    cluster_id,
+    text_results,
+    error_msg,
+):
+    return {
+        "is_error": True,
+        "error": str(error_msg),
+        "message": text_results,
+        "cluster_id": cluster_id,
+        "cluster_summary": {
+            "name": f"Error: {error_msg[:30]}...",
+            "summary": str(error_msg),
+        },
+        "ontology_items": {},
+        "low_quality_cluster": "1",
+    }
+
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("anthropic-secret")],
+    concurrency_limit=10,
+)
+def label_one_cluster(
+    cluster_id: str,
+    cluster_str: str,
+    model="claude-3-5-haiku-20241022",
+    max_tokens: int = 1000,
+    temperature: float = 0.0,
+    max_retries: int = 3,
+):
+    """Labels a single cluster with error handling and retries"""
+
+    message = ONTOLOGY_LABEL_CLUSTER_PROMPT.format(
+        ontology=ontology,
+        tweet_texts=cluster_str,
+        ontology=ontology,
+        previous_ontology="",
     )
+    for attempt in range(max_retries):
+        try:
+            client = anthropic.Anthropic()
+            send_msg = {"role": "user", "content": message}
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[send_msg],
+            )
+            text_results = response.content[0].text
+        except Exception as e:
+            if attempt == max_retries - 1:
+                result = make_error_result(cluster_id, "", f"Query failed: {e}")
+            continue
+        try:
+            answer = extract_special_tokens(text_results, tokens=["ANSWER"])["ANSWER"]
+        except Exception as e:
+            result = make_error_result(
+                cluster_id, text_results, f"Token extraction failed: {e}"
+            )
+            continue
+        try:
+            parsed_answer = parse_extracted_data(answer)["ANSWER"]
+        except Exception as e:
+            result = make_error_result(cluster_id, text_results, f"Parse failed: {e}")
+            continue
 
-    # Ensure 'parent' column is string before saving
-    hierarchy_df["parent"] = hierarchy_df["parent"].astype(str)
+        validation_result = validate_ontology_results(parsed_answer, ontology)
+        if not validation_result["valid"]:
+            result = make_error_result(
+                cluster_id,
+                text_results,
+                f"Validation failed: {validation_result['info']}",
+            )
+            continue
+        else:
+            return {
+                "cluster_id": cluster_id,
+                "is_error": False,
+                "message": text_results,
+                "ontology_items": pick(
+                    [
+                        k
+                        for k in ontology.keys()
+                        if k
+                        not in ["schema_info", "low_quality_cluster", "cluster_summary"]
+                    ],
+                    parsed_answer,
+                ),
+                "cluster_summary": pick(["name", "summary"], parsed_answer),
+                "low_quality_cluster": parsed_answer["low_quality_cluster"]["value"],
+            }
+    return result
 
-    # Save hierarchy with explicit schema
-    import pyarrow as pa
+
+# TODO finish this when relevant
+# def label_cluster_batch(
+#     cluster_label_data: List[Tuple[str, str]],
+#     model="claude-3-5-haiku-20241022",
+#     max_tokens: int = 1024,
+#     temperature: float = 0.0,
+# ):
+#     """Labels a batch of clusters using the Messages Batch API with proper retrieval handling"""
+
+#     client = anthropic.Anthropic()
+
+#     def make_request(cluster_id: str, prompt: str):
+#         return Request(
+#             custom_id=cluster_id,  # Use cluster_id as custom_id for tracking
+#             params=MessageCreateParamsNonStreaming(
+#                 model=model,
+#                 max_tokens=max_tokens,
+#                 messages=[{"role": "user", "content": prompt}],
+#             ),
+#         )
+
+#     messages = [
+#         ONTOLOGY_LABEL_CLUSTER_PROMPT.format(
+#             ontology=ontology,
+#             tweet_texts=cluster_str,
+#             ontology=ontology,
+#             previous_ontology="",
+#         )
+#         for cluster_id, cluster_str in cluster_label_data
+#     ]
+
+#     # Create the batch
+#     batch = client.beta.messages.batches.create(
+#         requests=[
+#             make_request(cluster_id, message)
+#             for (cluster_id, _), message in zip(cluster_label_data, messages)
+#         ]
+#     )
+
+#     # Poll until batch is complete
+#     while True:
+#         status = client.beta.messages.batches.retrieve(batch.id)
+#         if status.processing_status == "ended":
+#             break
+#         time.sleep(60)  # Wait 5 seconds before polling again
+
+#     # Get results
+#     results = []
+#     for result in client.beta.messages.batches.results(
+#         batch.id,
+#     ):
+#         results.append(result)
+
+#     return results
+
+
+ANTHROPIC_TOKEN_LIMIT_PER_MINUTE = 100000
+CHAR_PER_TOKEN = 4
+
+
+# Make batches based on token limits
+def make_batches(cluster_label_data):
+    max_batch_chars = ANTHROPIC_TOKEN_LIMIT_PER_MINUTE * CHAR_PER_TOKEN
+    batches = [[]]
+    for cluster_id, cluster_str in cluster_label_data:
+        cur_len = sum(len(cluster_str) for _, cluster_str in batches[-1])
+        if cur_len + len(cluster_str) > max_batch_chars:
+            batches.append([])
+        batches[-1].append((cluster_id, cluster_str))
+    return batches
+
+
+def label_level0_clusters(
+    df: pd.DataFrame,
+    hierarchy_df: pd.DataFrame,
+    trees: dict,
+    incomplete_trees: dict,
+    tfidf_labels: dict,
+    existing_labels: dict = None,
+    force_recompute: bool = False,
+    limit_clusters: int = None,
+) -> Tuple[pd.DataFrame, dict]:
+    """Label individual clusters (level 0) with their topics and summaries.
+
+    Args:
+        df: Main tweets DataFrame
+        hierarchy_df: Hierarchy information DataFrame
+        trees: Conversation trees dict
+        incomplete_trees: Incomplete conversation trees dict
+        tfidf_labels: TF-IDF labels for clusters
+        existing_labels: Optional dict of existing labels
+        force_recompute: Whether to force recomputation of existing labels
+
+    Returns:
+        Tuple of (level0_labels DataFrame, full cluster_labels dict)
+    """
+    limit_clusters = limit_clusters or len(hierarchy_df[hierarchy_df["level"] == 0])
+    # Check if level 0 clusters already have labels
+
+    unique_clusters = list(set(df["cluster"]))
+    # Label level 0 clusters
+    print("Labeling level 0 clusters...")
+    cluster_label_data = [
+        (
+            cluster_id,
+            make_cluster_str(df, trees, incomplete_trees, tfidf_labels, cluster_id),
+        )
+        for cluster_id in unique_clusters[:limit_clusters]
+        if cluster_id != -1
+    ]
+
+    batches = make_batches(cluster_label_data)
+
+    # Get full ontology results
+    label_cluster_results = []
+
+    for i, batch in enumerate(batches):
+        batch_results = label_one_cluster.starmap(batch, order_outputs=True)
+        label_cluster_results.extend(batch_results)
+        if i < len(batches) - 1:
+            time.sleep(30)
+
+    error_clusters = {}
+    cluster_ontology_items = {}
+    for result in label_cluster_results:
+        if result["is_error"]:
+            error_clusters[str(result["cluster_id"])] = result
+        else:
+            cluster_ontology_items[str(result["cluster_id"])] = result
+
+    if error_clusters:
+        print(f"Errors labeling {len(error_clusters)} clusters.")
+
+    # Extract required fields for hierarchy
+    level0_labels = pd.DataFrame(
+        [
+            {
+                "cluster_id": str(cid),
+                "name": labels["cluster_summary"]["name"],
+                "summary": labels["cluster_summary"]["summary"],
+                "level": 0,
+                "low_quality_cluster": labels["low_quality_cluster"]["value"] == "1",
+            }
+            for cid, labels in cluster_ontology_items.items()
+            if "cluster_summary" in labels
+            and "name" in labels["cluster_summary"]
+            and "summary" in labels["cluster_summary"]
+            and "low_quality_cluster" in labels
+        ]
+    )
+    print(f"Level 0 labels: {level0_labels}")
+
+    return level0_labels, cluster_ontology_items
+
+
+# the phase from which to start recomputing
+FORCE_RECOMPUTE_OPTIONS = ["all", "none", "process", "embed", "cluster", "label"]
+
+
+def decide_force_recompute(username: str):
+    paths = get_user_paths(username)
+    trees_exist = paths["trees"].exists()
+    incomplete_trees_exist = paths["incomplete_trees"].exists()
+    clustered_tweets_df_exist = paths["clustered_tweets_df"].exists()
+    cluster_ontology_items_exist = paths["cluster_ontology_items"].exists()
+    labeled_hierarchy_exist = paths["labeled_hierarchy"].exists()
+    hierarchy_df_exist = paths["hierarchy"].exists()
+    tweets_df_exist = paths["tweets_df"].exists()
+    embeddings_exist = paths["embeddings"].exists()
+
+    if (
+        trees_exist
+        and incomplete_trees_exist
+        and clustered_tweets_df_exist
+        and cluster_ontology_items_exist
+        and labeled_hierarchy_exist
+    ):
+        return {
+            "status": f"Exists! Load from volume twitter-archive-data.",
+            "username": username,
+            "paths": {
+                "trees": paths["trees"],
+                "incomplete_trees": paths["incomplete_trees"],
+                "clustered_tweets_df": paths["clustered_tweets_df"],
+                "cluster_ontology_items": paths["cluster_ontology_items"],
+                "labeled_hierarchy": paths["labeled_hierarchy"],
+            },
+        }
+    elif (
+        clustered_tweets_df_exist
+        and hierarchy_df_exist
+        and trees_exist
+        and incomplete_trees_exist
+    ):
+        force_recompute = "label"
+    elif embeddings_exist:
+        force_recompute = "cluster"
+    elif tweets_df_exist and trees_exist and incomplete_trees_exist:
+        force_recompute = "embed"
+    else:
+        force_recompute = "process"
+    return force_recompute
+
+
+def save_post_hydration_data(
+    username: str, tweets_df: pd.DataFrame, trees: dict, incomplete_trees: dict
+):
+    paths = get_user_paths(username)
+    tweets_df["created_at"] = tweets_df["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
+    tweets_df["retweet_count"] = tweets_df["retweet_count"].astype("int64")
+    tweets_df["favorite_count"] = tweets_df["favorite_count"].astype("int64")
+    tweets_df.to_parquet(
+        paths["clustered_tweets_df"], schema=CLUSTERED_TWEETS_DF_SCHEMA
+    )
+    pickle.dump(trees, open(paths["trees"], "wb"))
+    pickle.dump(incomplete_trees, open(paths["incomplete_trees"], "wb"))
+    print(f"Saved post-hydration data for {username}")
+
+
+def save_post_clustering_data(
+    username: str,
+    clustered_tweets_df: pd.DataFrame,
+    hierarchy_df: pd.DataFrame,
+    cluster_results: dict,
+):
+    paths = get_user_paths(username)
+    # Ensure IDs are strings
+    clustered_tweets_df["tweet_id"] = clustered_tweets_df["tweet_id"].astype(str)
+    clustered_tweets_df["accountId"] = clustered_tweets_df["accountId"].astype(str)
+    clustered_tweets_df["reply_to_tweet_id"] = clustered_tweets_df[
+        "reply_to_tweet_id"
+    ].astype(str)
+    clustered_tweets_df["reply_to_user_id"] = clustered_tweets_df[
+        "reply_to_user_id"
+    ].astype(str)
+    if pd.api.types.is_datetime64_any_dtype(clustered_tweets_df["created_at"]):
+        clustered_tweets_df["created_at"] = clustered_tweets_df[
+            "created_at"
+        ].dt.strftime("%Y-%m-%d %H:%M:%S%z")
+    clustered_tweets_df["retweet_count"] = clustered_tweets_df["retweet_count"].astype(
+        "int64"
+    )
+    clustered_tweets_df["favorite_count"] = clustered_tweets_df[
+        "favorite_count"
+    ].astype("int64")
+
+    # Save clustering results
+    np.save(paths["cluster_labels_arr"], cluster_results["labels"])
+    np.save(paths["cluster_probs"], cluster_results["probabilities"])
+    np.save(paths["soft_clusters"], cluster_results["soft_clusters"])
+    clustered_tweets_df.to_parquet(
+        paths["clustered_tweets_df"], schema=CLUSTERED_TWEETS_DF_SCHEMA
+    )
 
     schema = pa.schema(
         [
@@ -519,176 +940,14 @@ def cluster_tweets(username: str, force_recompute: bool = False):
         ]
     )
 
-    hierarchy_df.to_parquet(user_dir / "cluster_hierarchy.parquet", schema=schema)
-
-    hierarchy_time = time.time() - start_time
-    print(f"Hierarchy computation completed in {hierarchy_time:.2f} seconds")
-
-    # Save clusterer
-    print("Saving results...")
-    with open(clusterer_path, "wb") as f:
-        pickle.dump(clusterer, f)
-
-    # Save cluster assignments
-    clusters_data = {
-        "labels": cluster_labels.tolist(),
-        "probabilities": cluster_probs.tolist(),
-        "soft_clusters": soft_clusters.tolist(),
-    }
-    with open(clusters_path, "w") as f:
-        json.dump(clusters_data, f)
-
-    # Add clusters to dataframe and save
-    df["cluster"] = cluster_labels.astype(str)
-    df["cluster_prob"] = cluster_probs
-    print(f"Saving df with clusters to {df_path}, cols {df.columns}")
-    print(df)
-    df.to_parquet(df_path)
-
-    volume.commit()
-
-    return {
-        "base_clusters": {"n_clusters": base_n_clusters, "n_noise": base_n_noise},
-        "parent_clusters": {"n_clusters": parent_n_clusters, "n_noise": parent_n_noise},
-        "timing": {
-            "umap": umap_time,
-            "clustering": clustering_time,
-            "soft_clustering": soft_clustering_time,
-            "hierarchy": hierarchy_time,
-        },
-        # "hierarchy_df": hierarchy_df.to_dict("records"),
-    }
+    hierarchy_df.to_parquet(paths["hierarchy"], schema=schema)
+    print(f"Saved post-clustering data for {username}")
 
 
-@app.function(
-    image=image,
-    volumes={"/twitter_data": volume},
-    secrets=[modal.Secret.from_name("anthropic-secret")],
-)
-def label_one_cluster(cluster_id: str, tweet_texts: str):
-    """Labels a single cluster"""
-    return label_cluster(cluster_id, tweet_texts)
-
-
-@app.function(
-    image=image,
-    volumes={"/twitter_data": volume},
-    secrets=[modal.Secret.from_name("anthropic-secret")],
-)
-def label_clusters(username: str, force_recompute: bool = False):
-    """Labels both level 0 clusters and their parent groups (level 1)"""
-    print(f"Starting cluster labeling for {username}")
-    data_dir = Path("/twitter_data")
-    user_dir = data_dir / username
-    df_path = user_dir / "convo_tweets_tweets_df.parquet"
-    hierarchy_path = user_dir / "cluster_hierarchy.parquet"
-
-    # Load data
-    df = pd.read_parquet(df_path)
-    hierarchy_df = pd.read_parquet(hierarchy_path)
-    print(f"Hierarchy df shape: {hierarchy_df.shape}, columns: {hierarchy_df.columns}")
-    print(hierarchy_df)
-
-    # Check if level 0 clusters already have labels and we're not forcing recompute
-    level0_clusters = hierarchy_df[hierarchy_df["level"] == 0]
-    has_level0_labels = (
-        not force_recompute
-        and "name" in hierarchy_df.columns
-        and not level0_clusters["name"].isna().all()
-    )
-
-    if has_level0_labels:
-        print("Level 0 clusters already labeled, skipping...")
-        level0_labels = level0_clusters[
-            ["cluster_id", "name", "summary", "level", "bad_group_flag"]
-        ]
-    else:
-        # Label level 0 clusters
-        print("Labeling level 0 clusters...")
-        cluster_id_text_tuples = [
-            (cluster_id, get_cluster_tweet_texts(df, cluster_id))
-            for cluster_id in level0_clusters["cluster_id"]
-        ]
-        level0_results = label_one_cluster.starmap(
-            cluster_id_text_tuples, order_outputs=True
-        )
-        level0_labels = pd.DataFrame(
-            [
-                {
-                    "cluster_id": str(label_res["cluster_id"]),
-                    "name": label_res["name"],
-                    "summary": label_res["summary"],
-                    "level": 0,
-                    "bad_group_flag": label_res["bad_group_flag"],
-                }
-                for label_res in level0_results
-            ]
-        )
-
-    # Label parent clusters using hierarchy_df directly since it has the level column
-    print("Labeling level 1 clusters...")
-    merged_df = hierarchy_df.merge(
-        level0_labels[["cluster_id", "name", "summary", "bad_group_flag"]],
-        on="cluster_id",
-        how="left",
-        suffixes=("_old", ""),  # Keep the new labels without suffix
-    )
-
-    # Drop old label columns if they exist
-    cols_to_drop = [col for col in merged_df.columns if col.endswith("_old")]
-    merged_df = merged_df.drop(columns=cols_to_drop)
-
-    print(f"Merged df shape: {merged_df.shape}, columns: {merged_df.columns}")
-    print(merged_df[["cluster_id", "parent", "level", "name", "summary"]])
-    print(merged_df[["cluster_id", "parent", "level", "name", "summary"]].head(20))
-    level1_labels = label_cluster_groups(
-        merged_df,
-    )
-    level1_labels["level"] = 1
-
-    # Add bad_group_flag to level0_labels if not present
-    if "bad_group_flag" not in level0_labels.columns:
-        level0_labels["bad_group_flag"] = False
-
-    # Combine level 0 and level 1 labels
-    all_labels = pd.concat([level0_labels, level1_labels], ignore_index=True)
-
-    # Convert bad_group_flag to boolean
-    all_labels["bad_group_flag"] = all_labels["bad_group_flag"].map(
-        {"0": False, "1": True, 0: False, 1: True}
-    )
-    all_labels["bad_group_flag"] = all_labels["bad_group_flag"].fillna(False)
-
-    # Create final hierarchy DataFrame with consistent suffix handling
-    hierarchy_df = hierarchy_df.merge(
-        all_labels[["cluster_id", "name", "summary", "bad_group_flag"]],
-        on="cluster_id",
-        how="left",
-        suffixes=("_old", ""),  # Keep new labels without suffix
-    )
-
-    # Drop any old columns from previous merges
-    cols_to_drop = [col for col in hierarchy_df.columns if col.endswith("_old")]
-    hierarchy_df = hierarchy_df.drop(columns=cols_to_drop)
-
-    print(
-        f"Merged hierarchy_df shape: {hierarchy_df.shape}, columns: {hierarchy_df.columns}"
-    )
-
-    # Only fill bad_group_flag with False as that's a valid default
-    hierarchy_df["bad_group_flag"] = hierarchy_df["bad_group_flag"].fillna(False)
-
-    # Check for missing labels
-    missing_labels = hierarchy_df[
-        hierarchy_df["name"].isna() | hierarchy_df["summary"].isna()
-    ]
-    if not missing_labels.empty:
-        print(f"WARNING: Found {len(missing_labels)} clusters with missing labels:")
-        print(missing_labels[["cluster_id", "level", "name", "summary"]])
-
-    # Save with explicit schema
-    import pyarrow as pa
-
+def save_post_labeling_data(
+    username: str, labeled_hierarchy_df: pd.DataFrame, cluster_ontology_items: dict
+):
+    paths = get_user_paths(username)
     schema = pa.schema(
         [
             ("cluster_id", pa.string()),
@@ -696,100 +955,223 @@ def label_clusters(username: str, force_recompute: bool = False):
             ("level", pa.int64()),
             ("name", pa.string()),
             ("summary", pa.string()),
-            ("bad_group_flag", pa.bool_()),
+            ("low_quality_cluster", pa.bool_()),
         ]
     )
-
-    hierarchy_df.to_parquet(
-        user_dir / "labeled_cluster_hierarchy.parquet", schema=schema
-    )
-
-    volume.commit()
-
-    return {
-        "hierarchy_df": hierarchy_df,
-        "stats": {
-            "level0_clusters": len(level0_labels),
-            "level1_clusters": len(level1_labels),
-            "total_clusters": len(hierarchy_df),
-            "error_clusters": len(hierarchy_df[hierarchy_df["bad_group_flag"]]),
-        },
-    }
+    labeled_hierarchy_df.to_parquet(paths["labeled_hierarchy"], schema=schema)
+    with open(paths["cluster_ontology_items"], "w") as f:
+        json.dump(cluster_ontology_items, f, indent=2)
+    print(f"Saved post-labeling data for {username}")
 
 
-@app.function(image=image, volumes={"/twitter_data": volume}, timeout=600)
-def get_or_create_analysis(username_: str, force_recompute: bool = False):
-    """Check for cached analysis results or run full pipeline if needed"""
-    username = username_.lower()
-    data_dir = Path("/twitter_data")
-    user_dir = data_dir / username
-
-    # Define paths for all required files
-    required_files = {
-        "hierarchy": user_dir / "labeled_cluster_hierarchy.parquet",
-        "tweets": user_dir / "convo_tweets_tweets_df.parquet",
-        "incomplete_trees": user_dir / "convo_tweets_incomplete_trees.pkl",
-        "trees": user_dir / "convo_tweets_trees.pkl",
-        "embeddings": user_dir / "reduced_embeddings.npy",
-    }
-
-    # Check if all files exist and we're not forcing recompute
-    all_files_exist = all(path.exists() for path in required_files.values())
-
-    if all_files_exist and not force_recompute:
-        print(f"Found cached analysis for {username}")
-        return {
-            "status": "cached",
-            "paths": {name: str(path) for name, path in required_files.items()},
-        }
-
-    # Run each step of the pipeline with force_recompute
-    process_result = process_archive.remote(username, force_recompute)
-    print("Processing complete:", process_result)
-
-    embed_result = embed_tweets.remote(username, force_recompute)
-    print("Embedding complete:", embed_result)
-
-    cluster_result = cluster_tweets.remote(username, force_recompute)
-    print("Clustering complete:", cluster_result)
-
-    label_result = label_clusters.remote(username, force_recompute)
-    print("Labeling complete:", label_result)
-
+# I'll make this a modal function but we can copy it to be a local function later by looking up the app and volume
+@app.function(
+    image=image,
+    volumes={"/twitter-archive-data": volume},
+    secrets=[modal.Secret.from_name("anthropic-secret")],
+    timeout=1200,
+)
+def orchestrator(username: str, force_recompute: str = "none"):
+    """Orchestrator function that runs the entire pipeline"""
     volume.reload()
+    paths = get_user_paths(username)
+    paths["user_dir"].mkdir(exist_ok=True)
 
-    # Verify all files were created
-    missing_files = [name for name, path in required_files.items() if not path.exists()]
-    if missing_files:
-        raise RuntimeError(f"Pipeline completed but files missing: {missing_files}")
+    if force_recompute not in FORCE_RECOMPUTE_OPTIONS:
+        raise ValueError(f"Invalid force_recompute option: {force_recompute}")
 
-    return {
-        "status": "computed",
-        "paths": {name: str(path) for name, path in required_files.items()},
-        "pipeline_results": {
-            "process": process_result,
-            "embed": embed_result,
-            "cluster": cluster_result,
-            "label": label_result,
-        },
-    }
+    if force_recompute == "none":
+        force_recompute = decide_force_recompute(username)
+
+    tweets_df = None
+    trees = None
+    incomplete_trees = None
+    embeddings = None
+    clustered_tweets_df = None
+    hierarchy_df = None
+    labeled_hierarchy_df = None
+    cluster_ontology_items = None
+
+    # STEP 1:  Hydrate archive: get replies and make thread trees
+    # Check if processed file exists and we're not forcing recompute
+    if force_recompute not in ["all", "process"]:
+        print(f"Found cached processed tweets for {username}")
+        tweets_df = pd.read_parquet(paths["tweets_df"])
+        trees = pickle.load(open(paths["trees"], "rb"))
+        incomplete_trees = pickle.load(open(paths["incomplete_trees"], "rb"))
+    else:
+        archive = download_archive(username)
+
+        # Compute
+        result = process_archive_data.remote(archive, username)
+        tweets_df = result["tweets_df"]
+        trees = result["trees"]
+        incomplete_trees = result["incomplete_trees"]
+
+        # Save
+        save_post_hydration_data(username, tweets_df, trees, incomplete_trees)
+
+    # STEP 2: Embed tweets
+    if force_recompute not in ["all", "embed", "process"]:
+        print(f"Found cached embeddings for {username}")
+        embeddings = np.load(paths["embeddings"])
+    else:
+        texts = tweets_df["emb_text"]
+        embeddings = compute_embeddings.remote(texts)
+        np.save(paths["embeddings"], embeddings)
+
+    # STEP 3: Cluster tweets
+    if force_recompute not in ["all", "cluster", "embed", "process"]:
+        print(f"Found cached clusters for {username}")
+        clustered_tweets_df = pd.read_parquet(paths["clustered_tweets_df"])
+        hierarchy_df = pd.read_parquet(paths["hierarchy"])
+    else:
+        reduced_embeddings, umap_time = reduce_dimensions.remote(
+            embeddings, n_components=5
+        )
+        # Run clustering pipeline
+        min_cluster_size = max(
+            5, min(100, int(reduced_embeddings.shape[0] * 0.001) + 1)
+        )
+        min_samples = min_cluster_size
+        cluster_results = cluster_tweet_embeddings.remote(
+            reduced_embeddings, min_cluster_size, min_samples
+        )
+
+        # Update and save dataframe
+        clustered_tweets_df["cluster"] = cluster_results["labels"]
+        clustered_tweets_df["cluster_prob"] = cluster_results["probabilities"]
+
+        hierarchy_results = cluster_centroids.remote(
+            reduced_embeddings, cluster_results["labels"]
+        )
+        hierarchy_df = hierarchy_results["hierarchy_df"]
+
+        save_post_clustering_data(
+            username, clustered_tweets_df, hierarchy_df, cluster_results
+        )
+
+    # TODO STEP 4: Label clusters
+    if force_recompute not in ["all", "label", "cluster", "embed", "process"]:
+        print(f"Found cached labels for {username}")
+        labeled_hierarchy_df = pd.read_parquet(paths["labeled_hierarchy"])
+        cluster_ontology_items = json.load(open(paths["cluster_ontology_items"]))
+    else:
+        limit_clusters = 3
+        tfidf_labels = tfidf_label_clusters(
+            clustered_tweets_df,
+            n_top_terms=5,
+            exclude_words=["current", "root", "context"],
+        )
+        # Label level 0 clusters
+
+        # Label level 0 clusters
+        cluster_label_data = [
+            (
+                cluster_id,
+                make_cluster_str(
+                    clustered_tweets_df,
+                    trees,
+                    incomplete_trees,
+                    tfidf_labels,
+                    cluster_id,
+                ),
+            )
+            for cluster_id in list(set(clustered_tweets_df["cluster"]))[:limit_clusters]
+            if cluster_id != -1
+        ]
+
+        batches = make_batches(cluster_label_data)
+
+        # Get full ontology results
+        cluster_ontology_items = {}
+        for i, batch in enumerate(batches):
+            batch_results = label_one_cluster.starmap(batch, order_outputs=True)
+            for result in batch_results:
+                cluster_ontology_items[str(result["cluster_id"])] = result
+            if i < len(batches) - 1:
+                time.sleep(60)
+
+        # Check for errors
+        error_clusters = [
+            cid for cid, labels in cluster_ontology_items.items() if labels["is_error"]
+        ]
+        if error_clusters:
+            print(f"Errors labeling {len(error_clusters)} clusters.")
+
+        # Create labeled hierarchy dataframe
+        labeled_hierarchy_df = hierarchy_df.merge(
+            pd.DataFrame(
+                [
+                    {
+                        "cluster_id": str(cid),
+                        "name": labels["cluster_summary"]["name"],
+                        "summary": labels["cluster_summary"]["summary"],
+                        "level": 0,
+                        "low_quality_cluster": labels["low_quality_cluster"]["value"]
+                        == "1",
+                    }
+                    for cid, labels in cluster_ontology_items.items()
+                    if all(
+                        key in labels.get("cluster_summary", {})
+                        for key in ["name", "summary"]
+                    )
+                    and "low_quality_cluster" in labels
+                ]
+            )[["cluster_id", "name", "summary", "low_quality_cluster"]],
+            on="cluster_id",
+            how="left",
+            suffixes=("_old", ""),
+        ).drop(columns=lambda x: x.endswith("_old"))
+
+        # Label level 1 clusters and get final hierarchy
+
+        group_results = group_clusters(
+            clusters_df=labeled_hierarchy_df[
+                labeled_hierarchy_df["name"].notna()
+                & (labeled_hierarchy_df["level"] == 0)
+            ],
+            prompt=ONTOLOGY_GROUP_PROMPT,
+            ontology=group_ontology,
+        )
+
+        if group_results.get("is_error"):
+            raise ValueError(
+                f"Error grouping clusters: {group_results.get('error')}, {group_results}"
+            )
+
+        # Process results into DataFrame
+        # Create group rows
+        group_rows = []
+        for i, group in enumerate(group_results["groups"]):
+            group_id = f"1-{chr(65+i)}"  # Assign "1-A", "1-B", etc
+            group_rows.append(
+                {
+                    "cluster_id": group_id,
+                    "parent": "-1",
+                    "level": 1,
+                    "name": group["name"],
+                    "summary": group["summary"],
+                    "low_quality_cluster": False,
+                }
+            )
+
+        # Add group rows to DataFrame
+        labeled_hierarchy_df = pd.concat(
+            [labeled_hierarchy_df, pd.DataFrame(group_rows)], ignore_index=True
+        )
+
+        # Update member info
+        for i, group in enumerate(group_results["groups"]):
+            group_id = f"1-{chr(65+i)}"
+            for member in group["members"]:
+                mask = labeled_hierarchy_df["cluster_id"].astype(str) == str(
+                    member["id"]
+                )
+                labeled_hierarchy_df.loc[mask, "parent"] = group_id
 
 
 @app.local_entrypoint()
 def main():
-    username = "nosilverv"
-    # result = get_or_create_analysis.remote(username)
-
-    # Run each step of the pipeline
-    # process_result = process_archive.remote(username)
-
-    # print("Processing complete:", process_result)
-    # embed_result = embed_tweets.remote(username)
-    # print("Embedding complete:", embed_result)
-
-    cluster_result = cluster_tweets.remote(username, force_recompute=True)
-    print("Clustering complete:", cluster_result)
-
-    # label_result = label_clusters.remote(username, force_recompute=True)
-    # print("Labeling complete:", label_result)
-    # print("Analysis complete")
+    username = "exgenesis"
+    orchestrator.remote(username, force_recompute="none")

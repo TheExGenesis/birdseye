@@ -19,7 +19,7 @@ Respond in JSON format, delimited by <ANSWER>:
 {{
     "name": "📕 A punchy handle for this cluster",
     "summary": "A summary of the cluster themes",
-    "bad_group_flag": 0 or 1. Set to 1 if you think this grouping doesn't make sense"
+    "bad_group_flag": 0 or 1. Set to 1 if you think this grouping is ambiguous or low signal - stuff like small talk, short reactions, urls, etc."
 }}
 </ANSWER>
 """
@@ -42,7 +42,7 @@ Respond in JSON format, delimited by <ANSWER>:
 {{
     "name": "📚 A title for this group of clusters",
     "summary": "A summary of how these clusters relate",
-    "bad_group_flag": 0 or 1. Set to 1 if you think this grouping doesn't make sense"
+    "bad_group_flag": 0 or 1. Set to 1 if you think this grouping is ambiguous, low signal, or doesn't make sense."
 }}
 </ANSWER>
 """
@@ -139,7 +139,9 @@ def query_anthropic_model(
             temperature=temperature,
             messages=[send_msg],
         )
-        return response.content[0].text
+        text = response.content[0].text
+        print(f"Anthropic response: {text}")
+        return text
     except anthropic.APIError as e:
         print(f"Anthropic API error: {e}")
         raise
@@ -236,7 +238,6 @@ def get_cluster_tweet_texts(tweets_df: pd.DataFrame, cluster_id: int) -> str:
 def label_cluster(cluster_id: int, tweet_texts: str) -> Dict[str, Any]:
     """Processes a single cluster and returns the parsed results dict."""
     try:
-
         response_text = query_anthropic_model(
             LABEL_CLUSTER_PROMPT.format(tweet_texts=tweet_texts)
         )
@@ -312,7 +313,7 @@ def label_cluster_groups(
 
     # Process groups in parallel
     results = parallel_io_with_retry(
-        func=process_single_group,
+        func=label_single_group,
         data=group_strings,
         max_workers=max_workers,
         max_retries=max_retries,
@@ -370,7 +371,7 @@ def retry(max_retries=3, delay=2):
     return decorator
 
 
-def process_single_group(group_str: str) -> Dict[str, str]:
+def label_single_group(group_str: str) -> Dict[str, str]:
     """Process a single group of clusters using the Anthropic API.
 
     Args:
@@ -394,7 +395,7 @@ def process_single_group(group_str: str) -> Dict[str, str]:
         return results
 
     except Exception as e:
-        print(f"Error in process_single_group: {e}")
+        print(f"Error in label_single_group: {e}")
         return {
             "name": "Error Processing Group",
             "summary": f"Error occurred during processing: {str(e)}",

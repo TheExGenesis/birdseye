@@ -429,10 +429,16 @@ def build_incomplete_conversation_trees(found_tweets, found_liked):
     return trees
 
 
-def get_thread_embedding_text(tweet_id, trees, max_chars=1024):
+def get_thread_embedding_text(tweet_id, trees, max_chars=1024, include_date=False):
     """
     Create embedding text for a tweet with its conversation context,
     assembled in chronological order.
+
+    Args:
+        tweet_id: ID of the tweet
+        trees: Conversation trees dict
+        max_chars: Maximum characters in output text
+        include_date: Whether to include tweet dates
     """
     # Find conversation
     conv = next((tree for tree in trees.values() if tweet_id in tree["tweets"]), None)
@@ -442,22 +448,27 @@ def get_thread_embedding_text(tweet_id, trees, max_chars=1024):
     tweet = conv["tweets"][tweet_id]
     parts = []
 
+    def format_tweet(tweet_type, tweet_data):
+        text = clean_tweet_text(tweet_data["full_text"])
+        if include_date and "created_at" in tweet_data:
+            date = parse_twitter_date(tweet_data["created_at"]).strftime("%d %b %Y")
+            return f"[{tweet_type} {date}] {text}"
+        return f"[{tweet_type}] {text}"
+
     # Collect parts in chronological order
     root_id = conv["root"]
     if root_id and root_id != tweet_id:
-        parts.append(f"[root] {clean_tweet_text(conv['tweets'][root_id]['full_text'])}")
+        parts.append(format_tweet("root", conv["tweets"][root_id]))
 
     current_id = conv["parents"].get(tweet_id)
     context_parts = []
     while current_id and current_id != root_id:
-        context_parts.append(
-            f"[context] {clean_tweet_text(conv['tweets'][current_id]['full_text'])}"
-        )
+        context_parts.append(format_tweet("context", conv["tweets"][current_id]))
         current_id = conv["parents"].get(current_id)
     parts.extend(reversed(context_parts))
 
     # Add current tweet
-    parts.append(f"[current] {clean_tweet_text(tweet['full_text'])}")
+    parts.append(format_tweet("current", tweet))
 
     # select tweet first
     # Assemble within max_chars
@@ -572,8 +583,23 @@ def get_all_conversation_tweets(supabase, conv_map):
     return conversation_tweets
 
 
-def process_tweets(supabase, tweets_df):
+def process_tweets(supabase, archive, username, include_date=False):
+    accountId = archive["account"][0]["account"]["accountId"]
+    patched_tweets = patch_tweets_with_note_tweets(
+        archive.get("note-tweet", []), archive["tweets"]
+    )
+    tweets_df = create_tweets_df(patched_tweets, username, accountId)
 
+    # Ensure IDs are strings
+    tweets_df["tweet_id"] = tweets_df["tweet_id"].astype(str)
+    tweets_df["accountId"] = tweets_df["accountId"].astype(str)
+    tweets_df["reply_to_tweet_id"] = tweets_df["reply_to_tweet_id"].astype(str)
+
+    # filter df to tweets after 01-2019 if needed
+    if username == "exgenesis":
+        tweets_df = tweets_df[
+            tweets_df["created_at"] > pd.Timestamp("2019-01-01", tz="UTC")
+        ]
     reply_ids = tweets_df[tweets_df.reply_to_tweet_id.notna()].tweet_id.to_list()
     conv_map = get_all_conversation_ids(supabase, reply_ids)
     tweets_df["conversation_id"] = tweets_df["reply_to_tweet_id"].map(conv_map)
@@ -602,7 +628,7 @@ def process_tweets(supabase, tweets_df):
 
     tweets_df.loc[tweets_df["conversation_id"].notna(), "emb_text"] = tweets_df.loc[
         tweets_df["conversation_id"].notna(), "tweet_id"
-    ].apply(lambda x: get_thread_embedding_text(x, trees))
+    ].apply(lambda x: get_thread_embedding_text(x, trees, include_date=include_date))
 
     tweets_df.loc[
         tweets_df["reply_to_tweet_id"].notna() & tweets_df["conversation_id"].isna(),
@@ -611,30 +637,11 @@ def process_tweets(supabase, tweets_df):
         tweets_df["reply_to_tweet_id"].notna() & tweets_df["conversation_id"].isna(),
         "tweet_id",
     ].apply(
-        lambda x: get_thread_embedding_text(x, incomplete_trees)
+        lambda x: get_thread_embedding_text(
+            x, incomplete_trees, include_date=include_date
+        )
     )
 
     tweets_df = tweets_df[tweets_df["emb_text"] != ""]
     print(f"Filtered to {len(tweets_df)} tweets")
     return tweets_df.reset_index(drop=True), trees, incomplete_trees
-
-
-def check_and_process_tweets(supabase, tweets_df, base_filepath="convo_tweets"):
-    if not os.path.exists(f"{base_filepath}_tweets_df.csv"):
-        procesed_tweets_df, trees, incomplete_trees = process_tweets(
-            supabase, tweets_df
-        )
-        procesed_tweets_df.to_csv(f"{base_filepath}_tweets_df.csv", index=False)
-        with open(f"{base_filepath}_trees.pkl", "wb") as f:
-            pickle.dump(trees, f)
-        with open(f"{base_filepath}_incomplete_trees.pkl", "wb") as f:
-            pickle.dump(incomplete_trees, f)
-        print(f"Processed tweets saved to {base_filepath}")
-    else:
-        print(f"File {base_filepath} already exists, loading.")
-        procesed_tweets_df = pd.read_csv(f"{base_filepath}_tweets_df.csv")
-        with open(f"{base_filepath}_trees.pkl", "rb") as f:
-            trees = pickle.load(f)
-        with open(f"{base_filepath}_incomplete_trees.pkl", "rb") as f:
-            incomplete_trees = pickle.load(f)
-    return procesed_tweets_df, trees, incomplete_trees
