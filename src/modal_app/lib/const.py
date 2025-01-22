@@ -24,6 +24,10 @@ def get_user_paths(username: str) -> dict:
         "clustered_tweets_df": user_dir / "clustered_tweets_df.parquet",
         "cluster_ontology_items": user_dir / "cluster_ontology_items.json",
         "labeled_hierarchy": user_dir / "labeled_cluster_hierarchy.parquet",
+        "local_tweet_id_maps": user_dir / "local_tweet_id_maps.json",
+        "clustering_params": user_dir / "clustering_params.json",
+        "qts": user_dir / "qts.pkl",
+        "group_results": user_dir / "group_results.json",
     }
 
 
@@ -31,7 +35,7 @@ TWEETS_DF_SCHEMA = pa.schema(
     [
         ("tweet_id", pa.string()),
         ("username", pa.string()),
-        ("accountId", pa.string()),
+        ("account_id", pa.string()),
         (
             "created_at",
             pa.string(),
@@ -42,9 +46,9 @@ TWEETS_DF_SCHEMA = pa.schema(
         ("reply_to_tweet_id", pa.string()),
         ("reply_to_user_id", pa.string()),
         ("reply_to_username", pa.string()),
-        ("archive_upload_id", pa.int64()),
         ("conversation_id", pa.string()),
         ("emb_text", pa.string()),
+        ("quoted_tweet_id", pa.string()),
         # ("cluster", pa.string()),
         # ("cluster_prob", pa.float64()),
         # ("most_prob_cluster", pa.string()),
@@ -56,7 +60,7 @@ CLUSTERED_TWEETS_DF_SCHEMA = pa.schema(
     [
         ("tweet_id", pa.string()),
         ("username", pa.string()),
-        ("accountId", pa.string()),
+        ("account_id", pa.string()),
         ("created_at", pa.string()),
         ("full_text", pa.string()),
         ("retweet_count", pa.int64()),
@@ -64,13 +68,32 @@ CLUSTERED_TWEETS_DF_SCHEMA = pa.schema(
         ("reply_to_tweet_id", pa.string()),
         ("reply_to_user_id", pa.string()),
         ("reply_to_username", pa.string()),
-        ("archive_upload_id", pa.int64()),
         ("conversation_id", pa.string()),
         ("cluster", pa.string()),
         ("cluster_prob", pa.float64()),
         ("emb_text", pa.string()),
+        ("quoted_tweet_id", pa.string()),
         # ("most_prob_cluster", pa.string()),
         # ("most_prob_cluster_prob", pa.float64()),
+    ]
+)
+
+LABELED_HIERARCHY_DF_SCHEMA = pa.schema(
+    [
+        ("cluster_id", pa.string()),
+        ("parent", pa.string()),
+        ("level", pa.int64()),
+        ("name", pa.string()),
+        ("summary", pa.string()),
+        ("low_quality_cluster", pa.string()),
+    ]
+)
+
+HIERARCHY_DF_SCHEMA = pa.schema(
+    [
+        ("cluster_id", pa.string()),
+        ("parent", pa.string()),
+        ("level", pa.int64()),
     ]
 )
 

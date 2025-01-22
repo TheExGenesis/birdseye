@@ -1,17 +1,39 @@
 # %%
 from typing import Any, Callable, List, Dict, Tuple, Union
+
 from functools import partial
 import pandas as pd
-from .prompts import (
-    ONTOLOGY_GROUP_EXAMPLES,
-    ONTOLOGY_GROUP_PROMPT,
-    ontology,
-    group_ontology,
-)
+import sys
+
+
+if any("ipykernel" in arg for arg in sys.argv):
+    from lib.prompts import (
+        ONTOLOGY_GROUP_EXAMPLES,
+        ONTOLOGY_GROUP_PROMPT,
+        ontology,
+        group_ontology,
+        ONTOLOGY_LABEL_CLUSTER_PROMPT,
+        ONTOLOGY_LABEL_CLUSTER_EXAMPLE,
+    )
+    from lib.utils import pick, retry
+    from lib.openrouter_client import query_llm
+else:
+    from .prompts import (
+        ONTOLOGY_GROUP_EXAMPLES,
+        ONTOLOGY_GROUP_PROMPT,
+        ontology,
+        group_ontology,
+        ONTOLOGY_LABEL_CLUSTER_PROMPT,
+        ONTOLOGY_LABEL_CLUSTER_EXAMPLE,
+    )
+    from .utils import pick, retry
+    from .openrouter_client import query_llm
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 
-def tfidf_label_clusters(tweets_df, n_top_terms=3, exclude_words=None):
+def tfidf_label_clusters(
+    tweets_df, n_top_terms=3, exclude_words=["current", "quoted", "context", "root"]
+):
     if exclude_words is None:
         exclude_words = []
 
@@ -58,10 +80,16 @@ def validate_ontology_results(
             valid: bool indicating if valid
             info: list of missing required keys
     """
+    # print("validate results", results)
 
-    def validate_dict(results_dict: Dict, schema_dict: Dict, path: str = "") -> Dict[str, Any]:
+    def validate_dict(
+        results_dict: Dict, schema_dict: Union[Dict, List], path: str = ""
+    ) -> Dict[str, Any]:
+        # print("schema_dict path", path, schema_dict)
         required_keys = [k for k in schema_dict.keys() if k != "schema_info"]
-        missing = [f"{path}.{k}" if path else k for k in required_keys if k not in results_dict]
+        missing = [
+            f"{path}.{k}" if path else k for k in required_keys if k not in results_dict
+        ]
         if missing:
             return {"valid": False, "info": missing}
 
@@ -75,12 +103,13 @@ def validate_ontology_results(
             if isinstance(schema_value, list):
                 if not isinstance(value, list):
                     return {"valid": False, "info": [f"{curr_path} should be list"]}
-                
+
                 schema_item = schema_value[0]
                 for i, item in enumerate(value):
-                    result = validate_dict(item, schema_item, f"{curr_path}[{i}]")
-                    if not result["valid"]:
-                        return result
+                    if isinstance(schema_item, dict) or isinstance(schema_item, list):
+                        result = validate_dict(item, schema_item, f"{curr_path}[{i}]")
+                        if not result["valid"]:
+                            return result
 
             elif isinstance(schema_value, dict):
                 if not isinstance(value, dict):
@@ -106,7 +135,7 @@ def label_with_ontology(
     ontology: dict,
     return_error: bool = True,
     max_validation_retries: int = 3,
-    model: str = "claude-3-5-haiku-20241022",
+    model: str = "anthropic/claude-3.5-haiku-20241022:beta",
     **prompt_kwargs,
 ) -> Dict[str, Any]:
     """Labels input text using a provided ontology and prompt.
@@ -138,7 +167,10 @@ def label_with_ontology(
             )
 
             # Query model and extract results
-            response_text = query_anthropic_model(formatted_prompt, model=model)
+            response_text = query_llm(
+                message=formatted_prompt,
+                model=model,
+            )
             sp_toks = extract_special_tokens(response_text, tokens=["ANSWER"])
             results = parse_extracted_data(sp_toks)["ANSWER"]
 
@@ -222,7 +254,8 @@ def parallel_io_with_retry(
             try:
                 results[key] = future.result()
             except Exception as e:
-                print(f"Processing {data[key]} failed after retries: {e}")
+                breakpoint()
+                print(f"Processing {key} failed after retries: {e}")
                 results[key] = None
 
     if not is_dict:
@@ -233,46 +266,7 @@ def parallel_io_with_retry(
 import re
 import json
 from typing import List, Dict, Tuple
-import anthropic
-
-
-def query_anthropic_model(
-    prompt: str,
-    model: str = "claude-3-5-haiku-20241022",
-    max_tokens: int = 8192,
-    temperature: float = 0.0,
-) -> str:
-    """
-    Sends a prompt to the Anthropic model and returns the response text.
-
-    Args:
-        prompt (str): The prompt to send to the model.
-        model (str): The Anthropic model to use.
-        max_tokens (int): The maximum number of tokens for the response.
-        temperature (float): The temperature setting for randomness.
-
-    Returns:
-        str: The response text from the model.
-    """
-    try:
-        client = anthropic.Anthropic()
-        send_msg = {"role": "user", "content": prompt}
-        response = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=[send_msg],
-        )
-        return response.content[0].text
-    except anthropic.APIError as e:
-        print(f"Anthropic API error: {e}")
-        raise
-    except anthropic.APIConnectionError as e:
-        print(f"Connection error: {e}")
-        raise
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        raise
+import openai
 
 
 def extract_special_tokens(response_text: str, tokens: List[str]) -> Dict[str, str]:
@@ -332,7 +326,6 @@ def save_or_load_df(file_path, data_func, *args, **kwargs):
     return data
 
 
-import anthropic
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Tuple, List
 import time
@@ -357,11 +350,13 @@ def normalize_tweet(
     # ID - might be in data or passed as key
     normalized["tweet_id"] = tweet_data.get("tweet_id", tweet_id)
 
-    # Account info - could be account_id or accountId
-    normalized["accountId"] = tweet_data.get("accountId", tweet_data.get("account_id"))
-    if not normalized["accountId"]:
-        normalized["accountId"] = child_tweet.get(
-            "accountId", child_tweet.get("account_id")
+    # Account info - could be account_id or account_id
+    normalized["account_id"] = tweet_data.get(
+        "account_id", tweet_data.get("account_id")
+    )
+    if not normalized["account_id"] and child_tweet:
+        normalized["account_id"] = child_tweet.get(
+            "account_id", child_tweet.get("account_id")
         )
 
     # Username - fallback to reply_to_username from child
@@ -394,6 +389,9 @@ def normalize_tweet(
     # Handle None case for reply_to_username
     reply_username = tweet_data.get("reply_to_username")
     normalized["reply_to_username"] = reply_username.lower() if reply_username else ""
+
+    # Quote info
+    normalized["quoted_tweet_id"] = tweet_data.get("quoted_tweet_id")
 
     # Other fields
     normalized["archive_upload_id"] = tweet_data.get("archive_upload_id")
@@ -475,61 +473,102 @@ def tweet_to_str(tweet: dict, local_id: int = None) -> str:
         else:
             date_str = tweet["created_at"].strftime("%d %b %Y")
 
-    tweet_str = f'{"#" + str(local_id) if local_id else ""} @{tweet["username"]} ({date_str})\n{tweet["full_text"]}\n'
+    tweet_str = f'{"#" + str(local_id) if local_id else ""} @{tweet["username"] if tweet["username"] else "_"} ({date_str})\n{tweet["full_text"]}\n'
     return tweet_str
 
 
 def get_cluster_tweet_texts(
     tweets_df: pd.DataFrame,
     tfidf_labels: List[str],
-    cluster_id: int,
-    max_chars=10000,
-    username: str = "",
-) -> str:
+    max_chars: int = 50000,
+    dont_include_at_top_level: List[str] = [],
+) -> Tuple[str, Dict[str, int]]:
     """Get cluster summary with top TFIDF words and tweets sorted by engagement.
-    Includes replied-to tweets for context.
+    Includes replied-to tweets and quoted tweets for context.
+    Returns tuple of (formatted text, mapping of tweet_id to local_id)
     """
     # Start building output with TFIDF words
-    output = f"{'User: ' + username if username else ''}\nTop terms: {', '.join(tfidf_labels)}\n\n"
+    output = f"Top terms: {', '.join(tfidf_labels)}\n\n"
 
     # Filter and sort tweets
     cluster_tweets = (
-        tweets_df[
-            (~tweets_df["full_text"].str.startswith("RT @"))
-            & (tweets_df["cluster"] == cluster_id)
-        ]
-        .copy()
+        tweets_df.copy()
+        .drop_duplicates(subset=["tweet_id"], keep="first")
         .sort_values(by=["created_at"], ascending=True)
-    )  # Combined filtering and sorting
+    )
 
+    # Process all tweets first to get thread_text lengths
     displayed_tweet_ids = set()
     tweet_texts = []
     local_id_map = {}
     local_id = 1
 
-    def dfs_replies(tweet, depth=0):
-        nonlocal local_id  # Make local_id accessible
+    def dfs_replies(tweet, accum=[], depth=0):
+        nonlocal local_id
         displayed_tweet_ids.add(tweet["tweet_id"])
-        local_id_map[tweet["tweet_id"]] = local_id
+        local_id_map[local_id] = tweet["tweet_id"]
+
+        # Build tweet text with quote if it exists
         tweet_str = "\n".join(
-            [
-                "  " * depth + line
-                for line in tweet_to_str(tweet, local_id_map[tweet["tweet_id"]]).split(
-                    "\n"
-                )
-            ]
+            ["  " * depth + line for line in tweet_to_str(tweet, local_id).split("\n")]
         )
-        if len(output + tweet_str + "\n") <= max_chars:  # Check length before adding
-            tweet_texts.append(tweet_str)
+
+        # Add quoted tweet text if it exists
+        if (
+            "quoted_tweet_id" in tweet
+            and pd.notna(tweet["quoted_tweet_id"])
+            and tweet["quoted_tweet_id"] in tweets_df["tweet_id"].values
+        ):
+            quoted_tweet = tweets_df[
+                tweets_df["tweet_id"] == tweet["quoted_tweet_id"]
+            ].iloc[0]
+            quoted_text = "\n".join(
+                [
+                    "  " * (depth + 1) + "↳ " + line
+                    for line in tweet_to_str(quoted_tweet, None).split("\n")
+                ]
+            )
+            tweet_str += "\n" + quoted_text
+
+        if len(output + tweet_str + "\n") <= max_chars:
+            accum.append(tweet_str)
+
         replies = tweets_df[tweets_df["reply_to_tweet_id"] == tweet["tweet_id"]]
         local_id += 1
 
         for _, reply in replies.iterrows():
-            dfs_replies(reply, depth + 1)
+            accum = dfs_replies(reply, accum, depth + 1)
+        return accum
 
-    for _, tweet in cluster_tweets.iterrows():
-        if tweet["tweet_id"] not in displayed_tweet_ids:
-            dfs_replies(tweet)
+    cluster_tweets["thread_text"] = None
+    for idx, tweet in cluster_tweets.iterrows():
+        if (
+            tweet["tweet_id"] not in displayed_tweet_ids
+            and tweet["tweet_id"] not in dont_include_at_top_level
+        ):
+            thread_text_accum = []
+            thread_text_accum = dfs_replies(tweet, accum=thread_text_accum)
+            thread_text = "\n".join(thread_text_accum)
+            cluster_tweets.loc[idx, "thread_text"] = thread_text
+    # Binary search for like threshold that keeps total length under max_chars
+    min_likes = 0
+    max_likes = cluster_tweets["favorite_count"].max()
+    while True:
+        filtered_tweets = cluster_tweets[cluster_tweets["favorite_count"] >= min_likes]
+        total_len = len(output) + sum(
+            len(str(t)) for t in filtered_tweets["thread_text"] if pd.notna(t)
+        )
+
+        if (
+            total_len <= max_chars
+            or min_likes >= cluster_tweets["favorite_count"].max()
+        ):
+            break
+
+        min_likes += 1
+    # Use the found threshold to filter tweets
+    filtered_tweets = cluster_tweets[cluster_tweets["favorite_count"] >= min_likes]
+    tweet_texts = [t for t in filtered_tweets["thread_text"] if pd.notna(t)]
 
     # Add tweets until we hit char limit
     for tweet in tweet_texts:
@@ -538,25 +577,101 @@ def get_cluster_tweet_texts(
         output += tweet + "\n"
 
     output += f"\nTop terms: {', '.join(tfidf_labels)}"
-    return output
+    return output, local_id_map
 
 
-def make_cluster_str(tweet_df, trees, incomplete_trees, tfidf_labels, cluster_id):
+def make_cluster_str(
+    tweet_df, trees, incomplete_trees, tfidf_labels, cluster_id, qts, max_chars=100000
+):
+    """Make text representation of a cluster including replied and quoted tweets.
+
+    Args:
+        tweet_df: DataFrame containing all tweets
+        trees: Dict of conversation trees
+        incomplete_trees: Dict of incomplete conversation trees
+        tfidf_labels: Dict of TF-IDF labels for each cluster
+        cluster_id: ID of cluster to process
+        qts: Dict containing quote tweet data
+    """
+    # Get tweets for this cluster
     cluster_tweets = tweet_df[tweet_df["cluster"] == cluster_id].copy()
+
+    # Add replied and quoted tweets
     cluster_with_replies = add_replied_tweets(cluster_tweets, trees, incomplete_trees)
-    cluster_with_replies.loc[:, "cluster"] = cluster_id
-    cluster_with_replies.loc[:, "tweet_id"] = cluster_with_replies["tweet_id"].astype(
+    cluster_with_quotes = add_quoted_tweets(cluster_with_replies, qts)
+
+    # Set cluster and convert IDs to strings
+    cluster_with_quotes.loc[:, "cluster"] = cluster_id
+    cluster_with_quotes.loc[:, "tweet_id"] = cluster_with_quotes["tweet_id"].astype(
         "str"
     )
-    cluster_with_replies.loc[:, "reply_to_tweet_id"] = cluster_with_replies[
+    cluster_with_quotes.loc[:, "reply_to_tweet_id"] = cluster_with_quotes[
         "reply_to_tweet_id"
     ]
-    cluster_with_replies
 
-    cluster_str = get_cluster_tweet_texts(
-        cluster_with_replies, tfidf_labels[cluster_id], cluster_id, 200000
+    # qts that were added and weren't in tweet_df originally
+    dont_include_at_top_level = set(tweet_df.tweet_id).difference(
+        set(qts["quote_map"].keys())
     )
-    return cluster_str
+
+    cluster_str, local_id_map = get_cluster_tweet_texts(
+        tweets_df=cluster_with_quotes,
+        tfidf_labels=tfidf_labels[cluster_id],
+        max_chars=max_chars,
+        dont_include_at_top_level=dont_include_at_top_level,
+    )
+    return cluster_str, local_id_map
+
+
+def add_quoted_tweets(tweets_df: pd.DataFrame, qts: dict) -> pd.DataFrame:
+    """Add quoted tweets to a dataframe using quote data from qts dict.
+
+    Args:
+        tweets_df: DataFrame containing tweets that may have quotes
+        qts: Dict containing quote data with keys:
+            - quoted_tweets: Dict mapping tweet_id to quoted tweet data
+            - liked_quoted_tweets: Dict mapping tweet_id to liked quoted tweet data
+            - quote_map: Dict mapping quoting tweet_id to quoted tweet_id
+
+    Returns:
+        DataFrame with quoted tweets added, sorted by created_at
+    """
+    # Get tweets that have quotes
+    quoting_tweets = tweets_df[tweets_df["tweet_id"].isin(qts["quote_map"].keys())]
+
+    # Get quoted tweets data
+    quoted_tweets = []
+
+    for _, quoting_tweet in quoting_tweets.iterrows():
+        quoted_id = qts["quote_map"][quoting_tweet["tweet_id"]]
+
+        # Check regular quoted tweets
+        if quoted_id in qts["quoted_tweets"]:
+            tweet_data = qts["quoted_tweets"][quoted_id]
+            quoted_tweets.append(normalize_tweet(tweet_data, quoted_id))
+
+        # Check liked quoted tweets
+        # elif quoted_id in qts["liked_quoted_tweets"]:
+        #     tweet_data = qts["liked_quoted_tweets"][quoted_id]
+        #     quoted_tweets.append(normalize_tweet(tweet_data, quoted_id))
+
+    # Convert quoted tweets list to DataFrame
+    if quoted_tweets:
+        # Normalize the original tweets too
+        tweets_normalized = [
+            normalize_tweet(row.to_dict()) for _, row in tweets_df.iterrows()
+        ]
+
+        # Combine normalized data
+        all_tweets = tweets_normalized + quoted_tweets
+        combined_df = pd.DataFrame(all_tweets)
+
+        # Sort by date and deduplicate
+        combined_df = combined_df.sort_values("created_at").drop_duplicates(
+            subset="tweet_id", keep="first"
+        )
+        return combined_df
+    return tweets_df
 
 
 def group_to_string(df: pd.DataFrame, group_id: str) -> str:
@@ -584,21 +699,6 @@ def parse_response(response_text: str) -> Tuple[str, str]:
         raise ValueError(f"Empty name or summary parsed from response: {response_text}")
 
     return name, summary
-
-
-def retry(max_retries=3, delay=2):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            for _ in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception:
-                    time.sleep(delay)
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
 
 
 def escape_json_for_template(data: dict) -> str:
@@ -651,41 +751,106 @@ def group_into_time_periods(cluster_with_replies_df, min_size=5):
     return merged
 
 
-def group_clusters(
-    clusters_df: pd.DataFrame,
-    prompt: str = ONTOLOGY_GROUP_PROMPT,
-    ontology: dict = group_ontology,
-    return_error: bool = True,
-    max_validation_retries: int = 3,
-) -> Dict[str, Any]:
-    """Groups clusters based on their summaries using the provided ontology.
+def make_error_result(cluster_id: str, message: str, error: str) -> Dict[str, Any]:
+    """Create an error result dict"""
+    return {
+        "is_error": True,
+        "error": error,
+        "message": message,
+        "cluster_id": cluster_id,
+        "cluster_summary": {"name": f"Error: {error[:50]}...", "summary": error},
+        "ontology_items": {},
+        "low_quality_cluster": "1",
+    }
 
-    Args:
-        clusters_df: DataFrame containing cluster summaries with columns:
-                    cluster_id, name, summary
-        prompt: Template string for the grouping prompt
-        ontology: Dictionary defining group structure schema
-        return_error: If True, returns error info instead of raising
-        max_validation_retries: Number of retries on validation failure
 
-    Returns:
-        Dict containing the grouped results matching ontology structure
-    """
-    # Format clusters into readable string
-    clusters_str = ""
-    for _, row in clusters_df.iterrows():
-        cluster_str = (
-            f"Cluster {row['cluster_id']}: {row['name']}\n{row['summary']}\n\n"
-        )
-        clusters_str += cluster_str
+def label_one_cluster(
+    cluster_id: str,
+    cluster_str: str,
+    model="anthropic/claude-3.5-haiku-20241022:beta",
+    max_tokens: int = 8000,
+    temperature: float = 0.0,
+    max_retries: int = 4,
+):
+    """Labels a single cluster with error handling and retries"""
 
-    return label_with_ontology(
-        prompt=prompt,
+    print(f"labeling {cluster_id}")
+    message = ONTOLOGY_LABEL_CLUSTER_PROMPT.format(
         ontology=ontology,
-        return_error=return_error,
-        max_validation_retries=max_validation_retries,
-        clusters_str=clusters_str,  # Pass formatted clusters string to prompt
-        examples=ONTOLOGY_GROUP_EXAMPLES,
-        # model="claude-3-5-sonnet-20241022",
-        model="claude-3-5-haiku-20241022",
+        tweet_texts=cluster_str,
+        previous_ontology="",
+        example_answer=ONTOLOGY_LABEL_CLUSTER_EXAMPLE,
     )
+
+    for attempt in range(max_retries):
+        try:
+            start_time = time.time()
+            text_results = query_llm(
+                message=message,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            print(f"LLM call for {cluster_id} took {time.time() - start_time:.2f}s")
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                result = make_error_result(cluster_id, "", f"Query failed: {e}")
+            print(f"query failed for {cluster_id}")
+            continue
+
+        try:
+            answer = extract_special_tokens(text_results, tokens=["ANSWER"])
+        except Exception as e:
+            result = make_error_result(
+                cluster_id, text_results, f"Token extraction failed: {e}"
+            )
+            print(f"token extraction failed for {cluster_id}")
+            continue
+
+        try:
+            parsed_answer = parse_extracted_data(answer)["ANSWER"]
+            if not parsed_answer:
+                raise ValueError("Error parsing answer")
+        except Exception as e:
+            result = make_error_result(cluster_id, text_results, f"Parse failed: {e}")
+            print(f"failed to parse json for {cluster_id}")
+            continue
+        try:
+            validation_result = validate_ontology_results(parsed_answer, ontology)
+        except Exception as e:
+            result = make_error_result(
+                cluster_id, text_results, f"Validation failed: {e}"
+            )
+            print(f"validation failed for {cluster_id}")
+            continue
+        if not validation_result["valid"]:
+            result = make_error_result(
+                cluster_id,
+                text_results,
+                f"Validation failed: {validation_result['info']}",
+            )
+            print(f"validation failed for {cluster_id}")
+            continue
+        else:
+            print(f"validated {cluster_id}")
+            return {
+                "cluster_id": cluster_id,
+                "is_error": False,
+                "message": text_results,
+                "ontology_items": pick(
+                    [
+                        k
+                        for k in ontology.keys()
+                        if k
+                        not in ["schema_info", "low_quality_cluster", "cluster_summary"]
+                    ],
+                    parsed_answer,
+                ),
+                "cluster_summary": pick(
+                    ["name", "summary"], parsed_answer["cluster_summary"]
+                ),
+                "low_quality_cluster": parsed_answer["low_quality_cluster"]["value"],
+            }
+    print(f"error result: {result}")
+    return result
