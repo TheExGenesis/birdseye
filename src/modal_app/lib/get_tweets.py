@@ -53,6 +53,16 @@ else:
 
 from supabase import create_client
 
+# Add near the top of the file, after other imports
+import logging
+
+# Configure httpx logger to only show WARNING and above
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Add to existing logger configuration
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
 
 class ArchiveTweetData(TypedDict):
     tweet_id: str
@@ -108,7 +118,7 @@ def parallel_io_with_retry(
     func: Callable,
     data: Union[List[Any], Dict[Any, Any]],
     max_workers: int = 5,
-    max_retries: int = 3,
+    max_retries: int = 9,
     delay: int = 2,
 ) -> Union[List[Any], Dict[Any, Any]]:
     """
@@ -143,7 +153,7 @@ def parallel_io_with_retry(
             try:
                 results[key] = future.result()
             except Exception as e:
-                print(f"Processing {data[key]} failed after retries: {e}")
+                logger.warning(f"Processing {key} failed after retries: {e}")
                 results[key] = None
 
     if not is_dict:
@@ -203,7 +213,7 @@ def create_tweets_df(
     Returns:
         DataFrame with columns matching BaseTweetSchema
     """
-    print(f"Processing {len(tweets)} tweets")
+    logger.info(f"Processing {len(tweets)} tweets")
     tweets_df = pd.DataFrame(
         [
             {
@@ -221,7 +231,7 @@ def create_tweets_df(
             for t in tqdm(tweets, desc="Creating tweets dataframe")
         ]
     )
-    print(f"Created dataframe with {len(tweets_df)} rows")
+    logger.info(f"Created dataframe with {len(tweets_df)} rows")
     # Ensure IDs are strings
     tweets_df["tweet_id"] = tweets_df["tweet_id"].astype(str)
     tweets_df["account_id"] = tweets_df["account_id"].astype(str)
@@ -270,7 +280,7 @@ def get_liked_tweets(
         .execute()
     )
 
-    print(f"Found {len(response.data)} of {len(tweet_ids)} liked tweets")
+    logger.info(f"Found {len(response.data)} of {len(tweet_ids)} liked tweets")
 
     return {row["tweet_id"]: {"full_text": row["full_text"]} for row in response.data}
 
@@ -280,10 +290,12 @@ def get_tweets(supabase: Client, tweet_ids: List[str]) -> Dict[str, ArchiveTweet
     Get tweets that exist for the given tweet IDs.
     Returns dict of tweet_id -> tweet data matching 04_tweets.sql schema
     """
+    logger.debug(f"Fetching {len(tweet_ids)} tweets")
     response = supabase.table("tweets").select("*").in_("tweet_id", tweet_ids).execute()
 
-    print(f"Found {len(response.data)} of {len(tweet_ids)} tweets")
-
+    logger.info(
+        f"Retrieved {len(response.data)} tweets ({len(tweet_ids)-len(response.data)} missing)"
+    )
     return {
         row["tweet_id"]: {
             "tweet_id": row["tweet_id"],
@@ -319,7 +331,7 @@ def get_conversation_ids(
         .execute()
     )
 
-    print(f"Found {len(response.data)} of {len(tweet_ids)} conversation IDs")
+    logger.info(f"Found {len(response.data)} of {len(tweet_ids)} conversation IDs")
 
     return {row["tweet_id"]: row["conversation_id"] for row in response.data}
 
@@ -374,7 +386,7 @@ def get_tweets_by_conversation_ids(
         .execute()
     )
 
-    print(
+    logger.info(
         f"Retrieved {len(response.data)} tweets from {len(valid_conv_ids)} conversation IDs"
     )
 
@@ -382,7 +394,7 @@ def get_tweets_by_conversation_ids(
 
 
 def get_all_conversation_tweets(
-    supabase: Client, conv_map: Dict[str, str]
+    supabase: Client, conv_values: List[str]
 ) -> List[Dict[str, BaseTweetSchema]]:
     """Get tweets for all conversations in parallel batches"""
     logger = logging.getLogger(__name__)
@@ -392,20 +404,19 @@ def get_all_conversation_tweets(
         return get_tweets_by_conversation_ids(supabase, batch)
 
     # Get unique conversation IDs
-    conv_values = list(conv_map.values())
 
     # Process using batch_process
     conversation_tweets = batch_process(
         get_batch_tweets,
         conv_values,
-        batch_size=100,
+        batch_size=50,
         max_workers=10,
-        max_retries=5,
+        max_retries=9,
         delay=3,
     )
 
     logger.info(
-        f"Retrieved {len(conversation_tweets)} tweets from {len(conv_map)} conversation IDs"
+        f"Retrieved {len(conversation_tweets)} tweets from {len(conv_values)} conversation IDs"
     )
     return conversation_tweets
 
@@ -425,12 +436,14 @@ def get_batch_quotes(supabase: Client, batch: List[str]) -> Dict[str, str]:
     Returns:
         Dict mapping tweet_id -> quoted_tweet_id
     """
+    # logger.debug(f"Fetching quotes for batch of {len(batch)} tweets")
     response = (
         supabase.table("quote_tweets")
         .select("tweet_id, quoted_tweet_id")
         .in_("tweet_id", batch)
         .execute()
     )
+    logger.debug(f"Found {len(response.data)} quotes in batch of {len(batch)} tweets")
     # Return a single dict mapping tweet_id -> quoted_tweet_id
     return {row["tweet_id"]: row["quoted_tweet_id"] for row in response.data}
 
@@ -448,6 +461,7 @@ def build_conversation_trees(
         'paths': dict of leaf_id -> list of tweet_ids from root to leaf
     }
     """
+    logger.debug(f"Building trees from {len(tweets)} conversation tweets")
     conversations = {}
 
     # Organize tweets by conversation
@@ -491,11 +505,15 @@ def build_conversation_trees(
                 # Only process unvisited children
                 unvisited = [c for c in children if c not in visited]
                 if unvisited:
-                    # print(f"Adding {len(unvisited)} unvisited children of {current_id} to stack")
                     for child_id in unvisited:
                         visited.add(child_id)
                         stack.append((child_id, path + [child_id]))
 
+    # After building paths
+    total_paths = sum(len(conv["paths"]) for conv in conversations.values())
+    logger.info(
+        f"Built {total_paths} conversation paths across {len(conversations)} trees"
+    )
     return conversations
 
 
@@ -526,10 +544,17 @@ def get_incomplete_reply_chains(
     liked_queue = deque()
     found_liked = {}
 
+    # Add cycle protection to the queues
+    seen_tweets = set(current_ids)  # Track all IDs we've ever seen
+    seen_liked = set()
+
     while tweet_queue:
-        batch = list(tweet_queue)[:batch_size]
-        for _ in range(min(batch_size, len(tweet_queue))):
-            tweet_queue.popleft()
+        batch = []
+        while len(batch) < batch_size and tweet_queue:
+            tid = tweet_queue.popleft()
+            if tid not in seen_tweets:  # Prevent reprocessing
+                batch.append(tid)
+                seen_tweets.add(tid)
 
         new_tweets = get_tweets(supabase, batch)
         found_tweets.update(new_tweets)
@@ -548,9 +573,12 @@ def get_incomplete_reply_chains(
     liked_queue = deque(set(liked_queue).difference(current_ids))
 
     while liked_queue:
-        batch = list(liked_queue)[:batch_size]
-        for _ in range(min(batch_size, len(liked_queue))):
-            liked_queue.popleft()
+        batch = []
+        while len(batch) < batch_size and liked_queue:
+            tid = liked_queue.popleft()
+            if tid not in seen_liked:  # Prevent reprocessing
+                batch.append(tid)
+                seen_liked.add(tid)
 
         new_liked = get_liked_tweets(supabase, batch)
         found_liked.update(new_liked)
@@ -590,57 +618,69 @@ def build_incomplete_conversation_trees(
     all_tweets = {**found_tweets, **found_liked}
     parents = {}
     children = defaultdict(list)
+    visited = set()  # Track visited nodes to prevent cycles
 
-    # Build parent/child relationships
+    # Build parent/child relationships with cycle check
     for tweet_id, tweet in found_tweets.items():
         reply_to = tweet.get("reply_to_tweet_id")
         if reply_to and reply_to in all_tweets:
-            parents[tweet_id] = reply_to
-            children[reply_to].append(tweet_id)
+            if reply_to not in visited and tweet_id not in visited:
+                parents[tweet_id] = reply_to
+                children[reply_to].append(tweet_id)
+                visited.update({tweet_id, reply_to})
 
-    # Find roots (tweets with no parents)
-    roots = {tid: tweet for tid, tweet in all_tweets.items() if tid not in parents}
+    # Find roots (tweets with no parents that exist in our data)
+    roots = {
+        tid: tweet
+        for tid, tweet in all_tweets.items()
+        if tid not in parents and tid in found_tweets
+    }
 
     trees = {}
-    # Build tree for each root
-    for root_id in roots:
+    # Build tree for each root with depth limit
+    for i, root_id in enumerate(roots):
         tree = {
             "root": root_id,
-            "tweets": {root_id: all_tweets[root_id]},
+            "tweets": {},
             "children": defaultdict(list),
             "parents": {},
             "paths": {},
         }
 
-        # BFS to build paths
-        queue = deque([(root_id, [root_id])])
+        # BFS with cycle protection and depth limit
+        queue = deque([(root_id, [root_id], 0)])
         while queue:
-            current_id, path = queue.popleft()
+            current_id, path, depth = queue.popleft()
 
-            if current_id in children:
-                tree["children"][current_id].extend(children[current_id])
-                for child_id in children[current_id]:
+            # Safety against infinite loops
+            if depth > 100:  # Max depth for any reasonable conversation
+                logger.warning(f"Max depth reached at {current_id}")
+                break
+
+            # Add to tree if not already processed
+            if current_id not in tree["tweets"]:
+                tree["tweets"][current_id] = normalize_tweet(
+                    all_tweets[current_id],
+                    tweet_id=current_id,
+                    child_tweet=None,
+                )
+
+            # Process children with cycle check
+            for child_id in children.get(current_id, []):
+                if child_id not in tree["parents"]:  # Prevent re-parenting
                     tree["parents"][child_id] = current_id
-                    tree["tweets"][child_id] = all_tweets[child_id]
-                    queue.append((child_id, path + [child_id]))
-                tree["tweets"] = {
-                    k: normalize_tweet(
-                        v,
-                        tweet_id=k,
-                        child_tweet=(
-                            tree["tweets"][tree["children"][k][0]]
-                            if tree["children"][k]
-                            else None
-                        ),
-                    )
-                    for k, v in tree["tweets"].items()
-                }
-            else:
-                # Leaf node - store path
+                    tree["children"][current_id].append(child_id)
+                    queue.append((child_id, path + [child_id], depth + 1))
+
+            # Record path if leaf node
+            if not children.get(current_id):
                 tree["paths"][current_id] = path
 
         trees[root_id] = tree
+        if i % 100 == 0:
+            logger.info(f"Processed {i} trees")
 
+    logger.info(f"Built {len(trees)} incomplete trees")
     return trees
 
 
@@ -650,9 +690,29 @@ class QuotedTweetData(TypedDict):
     quote_map: Dict[str, str]
 
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def build_tweet_to_tree_index(trees: Dict[str, ConversationTree]) -> Dict[str, str]:
+    """Build an index mapping tweet IDs to their tree keys.
+
+    Args:
+        trees: Dict of tree_key -> ConversationTree
+
+    Returns:
+        Dict mapping tweet_id -> tree_key
+    """
+    index = {}
+    for tree_key, tree in trees.items():
+        for tweet_id in tree["tweets"]:
+            index[tweet_id] = tree_key
+    return index
+
+
 def get_thread_embedding_text(
     tweet_id: str,
-    trees: Dict[str, ConversationTree],
+    conv: Optional[ConversationTree],
     max_chars: int = 1024,
     include_date: bool = False,
     qts: Optional[QuotedTweetData] = None,
@@ -663,19 +723,18 @@ def get_thread_embedding_text(
 
     Args:
         tweet_id: ID of the tweet
-        trees: Conversation trees dict
+        conv: Single conversation tree containing the tweet
         max_chars: Maximum characters in output text
         include_date: Whether to include tweet dates
-        quoted_tweets: Dict of quoted tweets data
+        qts: Optional quoted tweets data
     """
+    if not conv:
+        return None
+
     if qts:
         quoted_tweets = qts["quoted_tweets"]
         liked_quoted_tweets = qts["liked_quoted_tweets"]
         quote_map = qts["quote_map"]
-    # Find conversation
-    conv = next((tree for tree in trees.values() if tweet_id in tree["tweets"]), None)
-    if not conv:
-        return None
 
     tweet = conv["tweets"][tweet_id]
     parts = []
@@ -683,7 +742,7 @@ def get_thread_embedding_text(
     def format_tweet(tweet_type, tweet_data):
         text = clean_tweet_text(tweet_data["full_text"])
         if "tweet_id" not in tweet_data:
-            print(f"Tweet has no tweet_id: {tweet_type} {tweet_data}")
+            logger.warning(f"Tweet has no tweet_id: {tweet_type} {tweet_data}")
         # Add quoted text if this tweet quotes another
         if (
             qts
@@ -786,7 +845,7 @@ def batch_process(
     items: List[T],
     batch_size: int = 100,
     max_workers: int = 10,
-    max_retries: int = 5,
+    max_retries: int = 9,
     delay: int = 3,
 ) -> Union[Dict[str, R], List[R]]:
     """Process items in parallel batches with retries.
@@ -804,11 +863,17 @@ def batch_process(
         - Combined dictionary from all batches if func returns dicts
         - Combined list from all batches if func returns lists
     """
+
     # Filter out None values
     items = [item for item in items if item is not None]
 
     # Create batches
     batches = [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+
+    logger.debug(
+        f"Processing {len(items)} items in {len(batches)} batches "
+        f"(batch_size={batch_size}, workers={max_workers})"
+    )
 
     # Process batches in parallel
     results = parallel_io_with_retry(
@@ -905,72 +970,48 @@ def normalize_tweet(
     return normalized
 
 
-def process_tweets(
-    supabase: Client,
-    archive: Dict[str, List[Dict[str, Any]]],
-    username: str,
-    include_date: bool = False,
-) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any], Dict[str, Dict[str, Any]]]:
-    """Process tweets from an archive and enrich with conversation context.
-
-    Args:
-        supabase: Supabase client instance
-        archive: Dictionary containing tweet archive data with keys like 'account', 'tweets', 'note-tweet'
-        username: Twitter username of the account
-        include_date: Whether to include dates in the embedding text
-
-    Returns:
-        Tuple containing:
-        - DataFrame of processed tweets
-        - Dict of conversation trees from the database
-        - Dict of incomplete conversation trees built from reply chains
-        - Dict containing quoted tweet data with keys:
-          - quoted_tweets: Dict of quoted tweets from tweets table
-          - liked_quoted_tweets: Dict of quoted tweets from liked_tweets table
-          - quote_map: Dict mapping tweet_ids to their quoted tweet ids
-    """
-    account_id = archive["account"][0]["account"]["accountId"]
-    patched_tweets = patch_tweets_with_note_tweets(
-        archive.get("note-tweet", []), archive["tweets"]
-    )
-    tweets_df = create_tweets_df(patched_tweets, username, account_id)
+def handle_quotes(supabase, tweets_df):
+    logger.info("Starting quote processing...")
+    quote_start = time.time()
 
     # Get quoted tweets
     tweet_ids = tweets_df.tweet_id.to_list()
     quote_map = batch_process(
         curry(get_batch_quotes, supabase),
         tweet_ids,
-        batch_size=500,
+        batch_size=400,
         max_workers=10,
-        max_retries=3,
+        max_retries=9,
         delay=2,
     )
 
-    # Get regular tweets first
-    # quoted_tweet_ids = [tid for tid in quote_map.values() if tid not in tweet_ids]
-    quoted_tweet_ids = [tid for tid in quote_map.values()]
+    quoted_tweet_ids = list(set([tid for tid in quote_map.values()]))
+    logger.info(f"Found {len(quoted_tweet_ids)} unique quoted tweets")
+
+    logger.debug("Fetching quoted tweets...")
     quoted_tweets = batch_process(
         lambda batch: get_tweets(supabase, batch),
         quoted_tweet_ids,
         batch_size=100,
         max_workers=10,
-        max_retries=5,
+        max_retries=9,
         delay=3,
     )
 
-    # Then get liked tweets for missing IDs
     missing_ids = [tid for tid in quoted_tweet_ids if tid not in quoted_tweets]
+    logger.debug(f"Checking {len(missing_ids)} missing IDs in liked tweets")
     liked_quoted_tweets = batch_process(
         lambda batch: get_liked_tweets(supabase, batch),
         missing_ids,
         batch_size=100,
         max_workers=10,
-        max_retries=5,
+        max_retries=9,
         delay=3,
     )
 
-    print(
-        f"Found {len(quoted_tweets)} tweets and {len(liked_quoted_tweets)} liked tweets"
+    logger.info(
+        f"Quote processing complete in {time.time()-quote_start:.2f}s. Found: "
+        f"{len(quoted_tweets)} regular / {len(liked_quoted_tweets)} liked"
     )
 
     qts = {
@@ -980,10 +1021,28 @@ def process_tweets(
     }
 
     # add quoted_tweets to tweets_df, id as a column, and the quoted-tweets as rows
+    # Add quoted_tweets to tweets_df
     tweets_df["quoted_tweet_id"] = tweets_df["tweet_id"].map(quote_map)
-    quoted_tweets_df = pd.DataFrame(quoted_tweets.values())
-    quoted_tweets_df["quoted_tweet_id"] = quoted_tweets_df["tweet_id"].map(quote_map)
-    tweets_df = pd.concat([tweets_df, quoted_tweets_df], ignore_index=True)
+    tweets_df["quoted_tweet_id"] = tweets_df["quoted_tweet_id"].replace(
+        {"None": pd.NA, "": pd.NA}
+    )
+    tweets_df["quoted_tweet_id"] = tweets_df["quoted_tweet_id"].astype(
+        "string[pyarrow]"
+    )
+
+    # Handle quoted tweets dataframe
+    if len(quoted_tweets) > 0:
+        quoted_tweets_df = pd.DataFrame(quoted_tweets.values())
+        quoted_tweets_df["quoted_tweet_id"] = quoted_tweets_df["tweet_id"].map(
+            quote_map
+        )
+        quoted_tweets_df["quoted_tweet_id"] = quoted_tweets_df[
+            "quoted_tweet_id"
+        ].replace({"None": pd.NA, "": pd.NA})
+        quoted_tweets_df["quoted_tweet_id"] = quoted_tweets_df[
+            "quoted_tweet_id"
+        ].astype("string[pyarrow]")
+        tweets_df = pd.concat([tweets_df, quoted_tweets_df], ignore_index=True)
 
     # Add quoted text to embedding text
     tweets_df["emb_text"] = tweets_df["full_text"].apply(
@@ -1002,58 +1061,174 @@ def process_tweets(
         tweets_df.at[idx, "emb_text"] = (
             f"[quoted] {quoted_text}\n{tweets_df.at[idx, 'emb_text']}"
         )
+    return tweets_df, qts
+
+
+def produce_trees(supabase, tweets_df):
+    logger.info("Starting conversation processing...")
+    conv_start = time.time()
 
     # Get conversation data
-    reply_ids = tweets_df[tweets_df.reply_to_tweet_id.notna()].tweet_id.to_list()
+    reply_ids = list(
+        set(tweets_df[tweets_df.reply_to_tweet_id.notna()].tweet_id.to_list())
+    )
+    logger.debug(f"Fetching conversation IDs for {len(reply_ids)} replies")
     conv_map = get_all_conversation_ids(supabase, reply_ids)
-    tweets_df["conversation_id"] = tweets_df["reply_to_tweet_id"].map(conv_map)
+    # Add conversation IDs
+    tweets_df["conversation_id"] = tweets_df["tweet_id"].map(conv_map)
+    tweets_df["conversation_id"] = tweets_df["conversation_id"].replace(
+        {"None": pd.NA, "": pd.NA}
+    )
+    tweets_df["conversation_id"] = tweets_df["conversation_id"].astype(
+        "string[pyarrow]"
+    )
 
-    conversation_tweets = get_all_conversation_tweets(supabase, conv_map)
+    # Get all unique conversation IDs
+    unique_conv_ids = list(set(conv_map.values()))
+    logger.debug(f"Fetching {len(unique_conv_ids)} unique conversation IDs")
+
+    # Get remote conversations
+    conversation_tweets = get_all_conversation_tweets(supabase, unique_conv_ids)
+    logger.info(
+        f"Found {len(conversation_tweets)} tweets in {len(unique_conv_ids)} remote conversations"
+    )
     trees = build_conversation_trees(conversation_tweets)
+    logger.info(
+        f"Conversation processing complete in {time.time()-conv_start:.2f}s. "
+        f"Built {len(trees)} trees from {len(unique_conv_ids)} remote conversations"
+    )
+    return tweets_df, trees
 
-    n_replies_w_conv_id = tweets_df["conversation_id"].notna().sum()
-    n_replies = tweets_df["reply_to_tweet_id"].notna().sum()
-    print(f"Found {n_replies_w_conv_id}/{n_replies} replies with conversation IDs")
+
+def produce_incomplete_trees(supabase, tweets_df):
+    logger.info("Starting incomplete chain processing...")
+    incomplete_start = time.time()
 
     replies_w_no_conv_id = tweets_df[
         tweets_df["reply_to_tweet_id"].notna() & tweets_df["conversation_id"].isna()
     ]
-
+    logger.info(f"Found {len(replies_w_no_conv_id)} replies without conversation ID")
     found_tweets, found_liked = get_incomplete_reply_chains(
         replies_w_no_conv_id, supabase, batch_size=100
     )
-
+    logger.info(
+        f"Found {len(found_tweets)} tweets and {len(found_liked)} liked tweets in incomplete reply chains"
+    )
     found_and_old = {**found_tweets, **df_to_tweet_dict(replies_w_no_conv_id)}
+    logger.info(f"Building incomplete trees for {len(found_and_old)} tweets")
     incomplete_trees = build_incomplete_conversation_trees(found_and_old, found_liked)
+    logger.info(
+        f"Incomplete chain processing complete in {time.time()-incomplete_start:.2f}s. "
+        f"Built {len(incomplete_trees)} incomplete trees"
+    )
     # Update embedding text with conversation context
-    tweets_df.loc[tweets_df["conversation_id"].notna(), "emb_text"] = tweets_df.loc[
-        tweets_df["conversation_id"].notna(), "tweet_id"
-    ].apply(
+    return tweets_df, incomplete_trees
+
+
+def update_embedding_text(tweets_df, trees, incomplete_trees, qts, include_date=False):
+    logger.info("Building conversation embedding texts...")
+    emb_start = time.time()
+
+    # Build indices for direct tweet -> conversation lookup
+    tweet_to_conv = {
+        tweet_id: tree_key
+        for tree_key, tree in trees.items()
+        for tweet_id in tree["tweets"]
+    }
+
+    # Update embedding text with conversation context
+    tweets_with_conv = tweets_df[tweets_df["tweet_id"].isin(tweet_to_conv)].copy()
+    tweets_with_conv["emb_text"] = tweets_with_conv["tweet_id"].apply(
         lambda x: get_thread_embedding_text(
             x,
-            trees,
+            trees[tweet_to_conv[x]],
             include_date=include_date,
             qts=qts,
         )
         or tweets_df.loc[tweets_df["tweet_id"] == x, "emb_text"].iloc[0]
     )
+    tweets_df.loc[tweets_with_conv.index, "emb_text"] = tweets_with_conv["emb_text"]
 
-    tweets_df.loc[
-        tweets_df["reply_to_tweet_id"].notna() & tweets_df["conversation_id"].isna(),
-        "emb_text",
-    ] = tweets_df.loc[
-        tweets_df["reply_to_tweet_id"].notna() & tweets_df["conversation_id"].isna(),
-        "tweet_id",
-    ].apply(
+    logger.info(
+        f"Built conversation embedding texts in {time.time()-emb_start:.2f}s "
+        f"for {len(tweets_with_conv)} tweets"
+    )
+    return tweets_df
+
+
+def update_incomplete_embedding_text(
+    tweets_df, incomplete_trees, qts, include_date=False
+):
+    logger.info("Building incomplete conversation embedding texts...")
+    inc_emb_start = time.time()
+
+    incomplete_tweet_to_conv = {
+        tweet_id: tree_key
+        for tree_key, tree in incomplete_trees.items()
+        for tweet_id in tree["tweets"]
+    }
+
+    tweets_with_incomplete = tweets_df[
+        tweets_df["tweet_id"].isin(incomplete_tweet_to_conv)
+    ].copy()
+    tweets_with_incomplete["emb_text"] = tweets_with_incomplete["tweet_id"].apply(
         lambda x: get_thread_embedding_text(
             x,
-            incomplete_trees,
+            incomplete_trees[incomplete_tweet_to_conv[x]],
             include_date=include_date,
             qts=qts,
         )
         or tweets_df.loc[tweets_df["tweet_id"] == x, "emb_text"].iloc[0]
+    )
+    tweets_df.loc[tweets_with_incomplete.index, "emb_text"] = tweets_with_incomplete[
+        "emb_text"
+    ]
+
+    logger.info(
+        f"Built incomplete conversation embedding texts in {time.time()-inc_emb_start:.2f}s "
+        f"for {len(tweets_with_incomplete)} tweets"
+    )
+    return tweets_df
+
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# username = "silverarm0r"
+username = "DRMacIver"
+include_date = False
+
+
+def process_tweets(
+    supabase: Client,
+    archive: Dict[str, List[Dict[str, Any]]],
+    username: str,
+    include_date: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    logger.info(f"Starting tweet processing for @{username}")
+    start_time = time.time()
+
+    account_id = archive["account"][0]["account"]["accountId"]
+    patched_tweets = patch_tweets_with_note_tweets(
+        archive.get("note-tweet", []), archive["tweets"]
+    )
+
+    tweets_df = create_tweets_df(patched_tweets, username, account_id)
+
+    tweets_df, qts = handle_quotes(supabase, tweets_df)
+    tweets_df, trees = produce_trees(supabase, tweets_df)
+
+    tweets_df, incomplete_trees = produce_incomplete_trees(supabase, tweets_df)
+
+    tweets_df = update_embedding_text(
+        tweets_df, trees, incomplete_trees, qts, include_date
+    )
+    tweets_df = update_incomplete_embedding_text(
+        tweets_df, incomplete_trees, qts, include_date
     )
 
     tweets_df = tweets_df[tweets_df["emb_text"] != ""]
-    print(f"Filtered to {len(tweets_df)} tweets")
+    logger.info(f"Filtered to {len(tweets_df)} tweets")
+    logger.info(
+        f"Processing complete. Final dataset: {len(tweets_df)} tweets "
+        f"({time.time()-start_time:.2f}s)"
+    )
     return tweets_df.reset_index(drop=True), trees, incomplete_trees, qts
