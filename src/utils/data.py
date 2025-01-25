@@ -55,7 +55,11 @@ def fetch_users_with_profiles(account_ids: List[str]) -> Dict[str, Dict[str, Any
     single_profile_users = {
         user["account_id"]: {
             **user,
-            "profile": max(user["profile"], key=lambda x: x["archive_upload_id"]),
+            "profile": (
+                max(user["profile"], key=lambda x: x["archive_upload_id"])
+                if isinstance(user["profile"], list)
+                else user["profile"]
+            ),
         }
         for user in profile_result.data
         if user["account_id"] in account_ids

@@ -66,6 +66,16 @@ def centered_container(content_callable):
         return content_callable()
 
 
+def back_to_user_selection():
+    st.session_state["selected_user"] = None
+    st.query_params["username"] = ""
+    if "clicked_refs" in st.query_params:
+        del st.query_params["clicked_refs"]
+    if "cluster_id" in st.query_params:
+        del st.query_params["cluster_id"]
+    st.session_state["needs_rerun"] = True  # Add flag for rerun
+
+
 import modal
 
 
@@ -97,6 +107,7 @@ usernames = get_usernames_from_volume()
 
 def on_user_change():
     """Reset relevant query params when user changes"""
+    # Remove direct rerun, let the main flow handle state changes
     st.query_params.update(
         {
             "username": st.session_state.user_select,
@@ -109,6 +120,7 @@ def on_user_change():
     # Reset session state
     st.session_state["selected_cluster_id"] = None
     st.session_state["clicked_reference_tweets"] = set()
+    st.session_state["needs_rerun"] = True  # Add flag for rerun
 
 
 @st.cache_data(ttl=36000)
@@ -116,28 +128,29 @@ def cached_load_user_data(username, force_recompute="none"):
     """Load and cache user data"""
     lowercase_username = username.lower()
     data = load_user_data(lowercase_username, force_recompute=force_recompute)
-    print(data.keys())
-    tweets_df = data["clustered_tweets_df.parquet"][
-        [
-            col
-            for col in data["clustered_tweets_df.parquet"].columns
-            if col not in ["emb_text"]
-        ]
-    ]
-    if "accountId" in tweets_df.columns:
-        tweets_df["account_id"] = tweets_df["accountId"].astype(str)
-        tweets_df = tweets_df.drop(columns=["accountId"])
+    return data
+    # print(data.keys())
+    # tweets_df = data["clustered_tweets_df.parquet"][
+    #     [
+    #         col
+    #         for col in data["clustered_tweets_df.parquet"].columns
+    #         if col not in ["emb_text"]
+    #     ]
+    # ]
+    # if "accountId" in tweets_df.columns:
+    #     tweets_df["account_id"] = tweets_df["accountId"].astype(str)
+    #     tweets_df = tweets_df.drop(columns=["accountId"])
 
-    return (
-        tweets_df,
-        data["labeled_cluster_hierarchy.parquet"],
-        data["trees.pkl"],
-        data["incomplete_trees.pkl"],
-        data["cluster_ontology_items.json"],
-        data["local_tweet_id_maps.json"],
-        data["group_results.json"],
-        data["qts.pkl"],
-    )
+    # return (
+    #     tweets_df,
+    #     data["labeled_cluster_hierarchy.parquet"],
+    #     data["trees.pkl"],
+    #     data["incomplete_trees.pkl"],
+    #     data["cluster_ontology_items.json"],
+    #     data["local_tweet_id_maps.json"],
+    #     data["group_results.json"],
+    #     data["qts.pkl"],
+    # )
 
 
 # After loading group_results, add helper functions
@@ -228,12 +241,7 @@ def render_loading_state(username: str, analysis_id: Optional[str] = None):
             elif status["status"] == "error":
                 st.error(f"Error during analysis: {status.get('error')}")
         else:
-            st.info(
-                f"""⏳ Starting analysis for @{username}... 
-                This process typically takes 20-40 minutes for a full archive.
-                You can leave this page and come back later - your analysis will
-                continue in the background."""
-            )
+            st.info(f"""Error loading data.""")
 
 
 # Add user selection screen
@@ -257,6 +265,20 @@ def render_user_selection():
             st.rerun()
 
 
+def select_cluster(cluster_id: str):
+    print(
+        f"selected row selected_cluster_id: {st.session_state['selected_cluster_id']}"
+    )
+    st.session_state["selected_cluster_id"] = cluster_id
+    # Clear clicked references when cluster changes
+    st.session_state["clicked_reference_tweets"] = set()
+    # Update query params - remove clicked_refs and set new cluster_id
+    st.query_params["cluster_id"] = st.session_state["selected_cluster_id"]
+    if "clicked_refs" in st.query_params:
+        del st.query_params["clicked_refs"]
+    st.rerun()
+
+
 if not url_username:
     render_user_selection()
     st.stop()
@@ -270,7 +292,7 @@ st.session_state["selected_clusters"] = []
 analysis_id = st.session_state.get("analysis_id")
 
 try:
-    data = load_user_data(username, force_recompute="none")
+    data = cached_load_user_data(username, force_recompute="none")
     if data is None:
         if not analysis_id:
             # Start new analysis
@@ -463,21 +485,11 @@ try:
                             st.session_state["selected_cluster_id"]
                             != display_df.iloc[event.selection["rows"][0]]["cluster_id"]
                         ):
-                            print(
-                                f"selected row selected_cluster_id: {st.session_state['selected_cluster_id']}"
+                            select_cluster(
+                                display_df.iloc[event.selection["rows"][0]][
+                                    "cluster_id"
+                                ]
                             )
-                            st.session_state["selected_cluster_id"] = display_df.iloc[
-                                event.selection["rows"][0]
-                            ]["cluster_id"]
-                            # Clear clicked references when cluster changes
-                            st.session_state["clicked_reference_tweets"] = set()
-                            # Update query params - remove clicked_refs and set new cluster_id
-                            st.query_params["cluster_id"] = st.session_state[
-                                "selected_cluster_id"
-                            ]
-                            if "clicked_refs" in st.query_params:
-                                del st.query_params["clicked_refs"]
-                            st.rerun()
                     else:
                         print(
                             f"empty row selection selected_cluster_id: {st.session_state['selected_cluster_id']}"
@@ -485,7 +497,7 @@ try:
                         st.session_state["clicked_reference_tweets"] = set()
                         if "clicked_refs" in st.query_params:
                             del st.query_params["clicked_refs"]
-                        # st.rerun()
+                            st.rerun()
 
         if st.session_state["selected_cluster_id"]:
             cluster_row = hierarchy_df[
@@ -502,14 +514,6 @@ try:
             # Create columns for side-by-side layout
             with centered_container(lambda: st.container()):
                 stats_col, engaged_col, related_col = st.columns([2, 1, 1])
-
-                with stats_col:
-                    render_cluster_stats(cluster_row, cluster_tweets)
-
-                with engaged_col:
-                    render_engaged_users(
-                        st.session_state["selected_user"], cluster_tweets
-                    )
 
                 with related_col:
                     # Find related clusters
@@ -529,13 +533,17 @@ try:
                                 key=f"related_cluster_{cluster['id']}",
                                 use_container_width=True,
                             ):
-                                # Just update session state and let the URL handler at the bottom handle the query params
-                                st.session_state["selected_cluster_id"] = cluster["id"]
-                                st.session_state["clicked_reference_tweets"] = set()
-                                st.rerun()
+                                select_cluster(cluster["id"])
+
+                with stats_col:
+                    render_cluster_stats(cluster_row, cluster_tweets)
+
+                with engaged_col:
+                    render_engaged_users(
+                        st.session_state["selected_user"], cluster_tweets
+                    )
 
         if st.session_state["selected_cluster_id"]:
-
             yearly_summaries = ontology_items[st.session_state["selected_cluster_id"]][
                 "ontology_items"
             ].get("yearly_summaries", [])
@@ -570,6 +578,7 @@ try:
 except Exception as e:
     st.error(f"Error loading data: {e}")
     render_loading_state(username)
+    raise e
 
 # Move this URL handling section to the very end of the file
 if st.session_state.get("clicked_reference_tweets"):
@@ -587,12 +596,7 @@ current_params = dict(st.query_params)
 if current_params != new_params:
     st.query_params.update(new_params)
 
-
-def back_to_user_selection():
-    st.session_state["selected_user"] = None
-    st.query_params["username"] = ""
-    if "clicked_refs" in st.query_params:
-        del st.query_params["clicked_refs"]
-    if "cluster_id" in st.query_params:
-        del st.query_params["cluster_id"]
+# Near the end of the file, before URL handling
+if st.session_state.get("needs_rerun"):
+    del st.session_state["needs_rerun"]
     st.rerun()

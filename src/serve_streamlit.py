@@ -29,7 +29,7 @@ import modal
 # image definition.
 
 image = modal.Image.debian_slim(python_version="3.11").pip_install(
-    "streamlit~=1.40.0",
+    "streamlit~=1.41.0",
     "numpy~=1.26.4",
     "pandas~=2.2.2",
     "scikit-learn",
