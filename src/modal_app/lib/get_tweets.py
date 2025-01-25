@@ -1230,5 +1230,7 @@ def process_tweets(
     logger.info(
         f"Processing complete. Final dataset: {len(tweets_df)} tweets "
         f"({time.time()-start_time:.2f}s)"
+        f", {len(trees)} trees, {len(incomplete_trees)} incomplete trees, "
+        f"{len(qts['quoted_tweets'])} quoted tweets, {len(qts['liked_quoted_tweets'])} liked quoted tweets"
     )
     return tweets_df.reset_index(drop=True), trees, incomplete_trees, qts

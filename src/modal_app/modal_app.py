@@ -18,6 +18,15 @@
 # Add at the very top of your file
 import sys
 from pathlib import Path
+import logging
+from datetime import datetime
+
+# Configure logging format
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
 # Only modify path when running as notebook/interactive
 if any("ipykernel" in arg for arg in sys.argv):
@@ -93,30 +102,12 @@ else:
 
 # Configure GPU and model constants
 GPU_CONFIG = modal.gpu.T4()
-MODEL_ID = "BAAI/bge-base-en-v1.5"
-VECTOR_DIM = 1024
+# MODEL_ID = "jxm/cde-small-v2"
+MODEL_ID = "BAAI/bge-base-en-v1.5"  # 60 texts/sec on infinity on T4 , w bettertransformer, batch size 32
+MODEL_ID = "dunzhang/stella_en_400M_v5"  # 56 texts/sec on infinity on T4 , w bettertransformer, batch size 32
+
 BATCH_SIZE = 32
-
-# Replace transformers_image with CUDA-based image
-transformers_image = (
-    modal.Image.from_registry("nvidia/cuda:12.1.0-runtime-ubuntu22.04")
-    .pip_install("python3-pip")
-    .apt_install("python3", "python3-pip")
-    .pip_install(
-        "torch==2.2.1+cu121", 
-        index_url="https://download.pytorch.org/whl/cu121",
-        extra_index_url="https://pypi.org/simple",
-    )
-    .pip_install(
-        "transformers",
-        "scikit-learn",
-        "numpy~=1.26.4",
-        "pandas~=2.2.2",
-        "httpx",
-    )
-)
-
-# Create the app before using it in decorators
+DOCKER_IMAGE = "ghcr.io/huggingface/text-embeddings-inference:turing-1.5"  # Turing for T4s  # Create the app before using it in decorators
 app = modal.App(name="twitter-archive-analysis")
 
 
@@ -181,8 +172,29 @@ with image.imports():
     import toolz as tz
 
 
-def download_model():
-    spawn_server().terminate()
+# Replace TEI image and server setup with Infinity setup
+INFINITY_VERSION = "0.0.63"
+infinity_image = (
+    modal.Image.from_registry(f"michaelf34/infinity:{INFINITY_VERSION}")
+    .pip_install(
+        "infinity-emb[all]",
+        "httpx",
+        "numpy~=1.26.4",
+        "pandas~=2.2.2",
+        "supabase",
+        "tqdm",
+        "seaborn",
+        "openai",
+        "toolz",
+        "pyarrow",
+        "xformers",
+    )
+    .entrypoint([])
+)
+
+with infinity_image.imports():
+    from infinity_emb import AsyncEngineArray, EngineArgs
+    import httpx
 
 
 rapids_image = (
@@ -225,6 +237,78 @@ with rapids_image.imports():
     from modal_app.lib.cluster import find_optimal_clustering_params
 
 
+# Add these constants near the top
+MB_PER_TWEET = 0.5  # Conservative estimate of memory needed per tweet
+BASE_MEMORY = 128  # Base memory in MB (1GB)
+MAX_MEMORY = 32768  # Maximum memory in MB (32GB)
+
+
+def calculate_memory_requirement(n_tweets: int) -> int:
+    """Calculate memory requirement in MB based on number of tweets"""
+    memory = BASE_MEMORY + int(n_tweets * MB_PER_TWEET)
+    if memory > MAX_MEMORY:
+        print(
+            f"Warning: Required memory ({memory}MB) exceeds maximum ({MAX_MEMORY}MB). Using maximum available."
+        )
+    return min(memory, MAX_MEMORY)
+
+
+@app.cls(
+    gpu=GPU_CONFIG,
+    image=infinity_image,
+    concurrency_limit=10,
+    allow_concurrent_inputs=10,
+    memory=lambda args: calculate_memory_requirement(len(args[0])),
+)
+class InfinityEmbedder:
+
+    def __init__(self):
+        from infinity_emb import AsyncEngineArray, EngineArgs
+
+        ENGINE_ARGS = EngineArgs(
+            model_name_or_path=MODEL_ID,
+            model_warmup=False,
+            batch_size=32,
+            bettertransformer=False,
+            dtype="float16",
+        )
+        self.engine_args = ENGINE_ARGS
+
+    def _get_array(self):
+        from infinity_emb import AsyncEngineArray, EngineArgs
+
+        return AsyncEngineArray.from_args([self.engine_args])
+
+    @modal.build()
+    async def download_model(self):
+        print(f"downloading model {self.model_id} ...")
+        self._get_array()
+
+    @modal.method()
+    async def embed(self, inputs: list[str]):
+        logging.info(f"Embedding batch of {len(inputs)} texts")
+        start = time.time()
+        engine = self.engine_array[0]
+        embeddings, _ = await engine.embed(sentences=inputs)
+        logging.debug(f"Embedded batch in {time.time()-start:.3f}s")
+        return embeddings
+
+    @modal.enter()
+    async def enter(self):
+        logging.info("Starting embedding engine array")
+        start_time = time.time()
+        self.engine_array = self._get_array()
+        await self.engine_array.astart()
+        logging.info(f"Engine array started in {time.time()-start_time:.2f}s")
+
+    @modal.exit()
+    async def exit(self):
+        print("Shutting down engine array...")
+        if hasattr(self, "engine_array"):
+            await self.engine_array.astop()
+        print("Engine array shutdown complete")
+
+
 # Create persistent volume for data
 volume = modal.Volume.from_name("twitter-archive-data", create_if_missing=True)
 
@@ -257,69 +341,20 @@ def spawn_server() -> subprocess.Popen:
                 raise RuntimeError(f"launcher exited unexpectedly with code {retcode}")
 
 
-# Now we can use app.cls since app is defined
-@app.cls(
-    gpu=GPU_CONFIG,
-    image=transformers_image,
-    concurrency_limit=10,
-    allow_concurrent_inputs=10,
+@app.function(
+    image=image,
+    volumes={"/twitter-archive-data": volume},
+    timeout=6000,
+    memory=lambda args: calculate_memory_requirement(
+        len(args[0].get("tweets", [])) if isinstance(args[0], dict) else BASE_MEMORY
+    ),
 )
-class TransformerEmbedder:
-    @modal.enter()
-    def load_model(self):
-        from transformers import AutoModel, AutoTokenizer
-
-        """Initialize model and move to GPU"""
-        self.model = (
-            AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True).cuda().eval()
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-
-        # Optional: Load vector linear layer if needed
-        # self.vector_linear = torch.nn.Linear(self.model.config.hidden_size, VECTOR_DIM).cuda()
-        # vector_linear_dict = torch.load(...)
-        # self.vector_linear.load_state_dict(vector_linear_dict)
-
-    @modal.method()
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        import torch
-        from sklearn.preprocessing import normalize
-
-        """Embed a batch of texts"""
-        with torch.no_grad():
-            # Tokenize and move to GPU
-            inputs = self.tokenizer(
-                texts,
-                padding="longest",
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-            inputs = {k: v.cuda() for k, v in inputs.items()}
-
-            # Get embeddings
-            attention_mask = inputs["attention_mask"]
-            last_hidden_state = self.model(**inputs)[0]
-            last_hidden = last_hidden_state.masked_fill(
-                ~attention_mask[..., None].bool(), 0.0
-            )
-
-            # Mean pooling
-            embeddings = last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
-
-            # Optional: Project to desired dimension
-            # if hasattr(self, 'vector_linear'):
-            #     embeddings = self.vector_linear(embeddings)
-
-            # Normalize and convert to numpy
-            embeddings = normalize(embeddings.cpu().numpy())
-
-            return embeddings.tolist()
-
-
-@app.function(image=image, volumes={"/twitter-archive-data": volume}, timeout=6000)
-def process_archive_data(archive: dict, username: str) -> dict:
+def process_archive_data(archive: dict, username: str):
     """Process archive data and return processed dataframe and stats"""
+    logging.info(f"Processing archive for {username}")
+    tweet_count = len(archive.get("tweets", []))
+    logging.info(f"Archive contains {tweet_count} tweets")
+
     # Extract username and account_id from archive if not provided
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -327,6 +362,7 @@ def process_archive_data(archive: dict, username: str) -> dict:
         supabase, archive, username, include_date=False
     )
 
+    logging.info(f"Processed {processed_tweets_df.shape[0]} tweets")
     return {
         "tweets_df": processed_tweets_df,
         "trees": trees,
@@ -376,10 +412,17 @@ def reduce_dimensions(
 
 
 # Modify the cluster_tweet_embeddings function
-@app.function(gpu="T4", image=rapids_image, timeout=600)
+@app.function(
+    gpu="T4",
+    image=rapids_image,
+    timeout=600,
+    memory=lambda args: calculate_memory_requirement(
+        len(args[0]) if isinstance(args[0], np.ndarray) else BASE_MEMORY
+    ),
+)
 def cluster_tweet_embeddings(
     reduced_embeddings: np.ndarray,
-    username: str = None,  # Add username parameter
+    username: str = None,
     do_soft_clustering=False,
 ):
     """Clusters tweet embeddings using HDBSCAN"""
@@ -735,13 +778,30 @@ def get_running_jobs(username: str) -> list:
         return []
 
 
+# Add near the top with other constants
+from functools import lru_cache
+
+
+# Add after download_archive function
+def get_archive_tweet_count(archive: dict) -> int:
+    """Get number of tweets from archive dict"""
+    return len(archive.get("tweets", []))
+
+
 @app.function(
     image=image,
     volumes={"/twitter-archive-data": volume},
     secrets=[modal.Secret.from_name("openrouter-api-key")],
     timeout=36000,
+    memory=lambda args: calculate_memory_requirement(
+        len(download_archive(args[0]).get("tweets", []))
+        if isinstance(args[0], str)
+        else BASE_MEMORY
+    ),
 )
 def orchestrator(username: str, force_recompute: str = "none", stop_after: str = None):
+    logging.info(f"Starting pipeline for {username}")
+    logging.info(f"Force recompute mode: {force_recompute}")
     username = username.lower()
     """Orchestrator function that runs the entire pipeline"""
     # Check for already running jobs
@@ -780,7 +840,9 @@ def orchestrator(username: str, force_recompute: str = "none", stop_after: str =
         incomplete_trees = pickle.load(open(paths["incomplete_trees"], "rb"))
         qts = pickle.load(open(paths["qts"], "rb"))
     else:
+        logging.info(f"Processing raw archive data")
         archive = download_archive(username)
+        logging.info(f"Downloaded archive with {len(archive.get('tweets', []))} tweets")
 
         # Compute
         result = process_archive_data.remote(archive, username)
@@ -801,17 +863,26 @@ def orchestrator(username: str, force_recompute: str = "none", stop_after: str =
         embeddings = np.load(paths["embeddings"])
     else:
         texts = tweets_df["emb_text"].tolist()
-        embedder = TransformerEmbedder()
+        embedder = InfinityEmbedder()
+        embeddings = []
 
         # Create batches
         batches = [texts[i : i + BATCH_SIZE] for i in range(0, len(texts), BATCH_SIZE)]
 
         print(f"Starting embeddings for {len(texts)} texts")
-        # Process batches and collect results
-        embeddings = []
-        for batch_embeddings in embedder.embed.map(batches, order_outputs=True):
-            embeddings.extend(batch_embeddings)
+        start_time = time.time()
 
+        batch_embeddings = embedder.embed.map(batches, order_outputs=True)
+        for batch_embedding in batch_embeddings:
+            embeddings.extend(batch_embedding)
+
+        total_time = time.time() - start_time
+        texts_per_sec = len(texts) / total_time
+
+        print(f"Embedding completed in {total_time:.2f} seconds")
+        print(f"Average speed: {texts_per_sec:.1f} texts/second")
+
+        # Convert to numpy array
         embeddings = np.array(embeddings)
         np.save(paths["embeddings"], embeddings)
 
@@ -1021,38 +1092,32 @@ def orchestrator(username: str, force_recompute: str = "none", stop_after: str =
             group_results,
         )
 
-
-@app.function(
-    image=image,
-    volumes={"/twitter-archive-data": volume},
-    secrets=[modal.Secret.from_name("openrouter-api-key")],
-    timeout=36000,
-)
-def test_embedder(texts):
-    embedder = TransformerEmbedder()
-
-    # Create batches
-    batches = [texts[i : i + BATCH_SIZE] for i in range(0, len(texts), BATCH_SIZE)]
-
-    print(f"Starting embeddings for {len(texts)} texts")
-    # Collect all results from the map operation
-    batch_embeddings = list(embedder.embed.map(batches, order_outputs=True))
-    # Flatten the results if needed
-    embeddings = []
-    for batch in batch_embeddings:
-        embeddings.extend(batch)
-    return embeddings
+    try:
+        logging.info(f"Pipeline completed for {username}")
+        return {
+            "status": "success",
+            "username": username,
+            "paths": {
+                "trees": paths["trees"],
+                "incomplete_trees": paths["incomplete_trees"],
+                "clustered_tweets_df": paths["clustered_tweets_df"],
+                "cluster_ontology_items": paths["cluster_ontology_items"],
+                "labeled_hierarchy": paths["labeled_hierarchy"],
+            },
+        }
+    except Exception as e:
+        logging.error(f"Pipeline failed: {str(e)}", exc_info=True)
+        raise
 
 
 @app.local_entrypoint()
 def main():
-    texts = ["hello world", "hello world", "hello world", "hello world"]
-    batch_embeddings = test_embedder.remote(texts)
-    print(batch_embeddings)
-    # usernames = ["silverarm0r"]
-    # for username in usernames:
-    #     print(f"\n\n\nProcessing {username}")
-    #     orchestrator.remote(username.lower(), stop_after="embed")
+    usernames = ["sunriseoath"]
+    usernames = ["DRMacIver"]
+    usernames = ["silverarm0r"]
+    for username in usernames:
+        print(f"\n\n\nProcessing {username}")
+        orchestrator.remote(username.lower(), force_recompute="label")
 
 
 # %%

@@ -424,23 +424,32 @@ def add_replied_tweets(
     # Get replied tweets from trees and incomplete_trees
     replied_tweets = []
 
+    # Create lookup dicts mapping tweet IDs to their containing trees
+    tweet_to_tree = {
+        tweet_id: tree["tweets"]
+        for tree in trees.values()
+        for tweet_id in tree["tweets"]
+    }
+    incomplete_tweet_to_tree = {
+        tweet_id: tree["tweets"]
+        for tree in incomplete_trees.values()
+        for tweet_id in tree["tweets"]
+    }
+
     for _, reply_tweet in reply_tweets.iterrows():
         tweet_id = reply_tweet["reply_to_tweet_id"]
         child_data = reply_tweet.to_dict()
 
         # Check trees first
-        for tree in trees.values():
-            if tweet_id in tree["tweets"]:
-                tweet_data = tree["tweets"][tweet_id]
-                replied_tweets.append(normalize_tweet(tweet_data, tweet_id, child_data))
-                break
+        if tweet_id in tweet_to_tree:
+            tweet_data = tweet_to_tree[tweet_id][tweet_id]
+            replied_tweets.append(normalize_tweet(tweet_data, tweet_id, child_data))
+            continue
 
-        # Then check incomplete_trees
-        for tree in incomplete_trees.values():
-            if tweet_id in tree["tweets"]:
-                tweet_data = tree["tweets"][tweet_id]
-                replied_tweets.append(normalize_tweet(tweet_data, tweet_id, child_data))
-                break
+        # Then check incomplete trees
+        if tweet_id in incomplete_tweet_to_tree:
+            tweet_data = incomplete_tweet_to_tree[tweet_id][tweet_id]
+            replied_tweets.append(normalize_tweet(tweet_data, tweet_id, child_data))
 
     # Convert replied tweets list to DataFrame
     if replied_tweets:
