@@ -33,7 +33,6 @@ def fetch_users_with_profiles(account_ids: List[str]) -> Dict[str, Dict[str, Any
         .select(
             """
         account_id, username, account_display_name,
-        bio, location, website,
         num_tweets, num_following, num_followers, num_likes
     """
         )
@@ -45,7 +44,7 @@ def fetch_users_with_profiles(account_ids: List[str]) -> Dict[str, Dict[str, Any
     profile_result = (
         supabase.table("account")
         .select(
-            "account_id, username, profile!inner(avatar_media_url, archive_upload_id)"
+            "account_id, username, profile!inner(bio, location, website,avatar_media_url, archive_upload_id)"
         )
         .in_("account_id", account_ids)
         .execute()
