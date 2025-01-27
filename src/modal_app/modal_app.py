@@ -415,7 +415,7 @@ def reduce_dimensions(
 @app.function(
     gpu="T4",
     image=rapids_image,
-    timeout=600,
+    timeout=3600,
     memory=lambda args: calculate_memory_requirement(
         len(args[0]) if isinstance(args[0], np.ndarray) else BASE_MEMORY
     ),
@@ -1115,9 +1115,10 @@ def main():
     usernames = ["sunriseoath"]
     usernames = ["DRMacIver"]
     usernames = ["silverarm0r"]
+    usernames = ["visakanv"]
     for username in usernames:
         print(f"\n\n\nProcessing {username}")
-        orchestrator.remote(username.lower(), force_recompute="label")
+        orchestrator.remote(username.lower())
 
 
 # %%
