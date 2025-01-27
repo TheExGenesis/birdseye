@@ -1008,7 +1008,6 @@ def handle_quotes(supabase, tweets_df):
         max_retries=9,
         delay=3,
     )
-
     logger.info(
         f"Quote processing complete in {time.time()-quote_start:.2f}s. Found: "
         f"{len(quoted_tweets)} regular / {len(liked_quoted_tweets)} liked"
@@ -1020,6 +1019,7 @@ def handle_quotes(supabase, tweets_df):
         "quote_map": quote_map,
     }
 
+    logger.info("Adding quoted tweet IDs to dataframe...")
     # add quoted_tweets to tweets_df, id as a column, and the quoted-tweets as rows
     # Add quoted_tweets to tweets_df
     tweets_df["quoted_tweet_id"] = tweets_df["tweet_id"].map(quote_map)
@@ -1032,6 +1032,7 @@ def handle_quotes(supabase, tweets_df):
 
     # Handle quoted tweets dataframe
     if len(quoted_tweets) > 0:
+        logger.info(f"Adding {len(quoted_tweets)} quoted tweets to dataframe...")
         quoted_tweets_df = pd.DataFrame(quoted_tweets.values())
         quoted_tweets_df["quoted_tweet_id"] = quoted_tweets_df["tweet_id"].map(
             quote_map
@@ -1044,23 +1045,38 @@ def handle_quotes(supabase, tweets_df):
         ].astype("string[pyarrow]")
         tweets_df = pd.concat([tweets_df, quoted_tweets_df], ignore_index=True)
 
+    logger.info("Adding embedding text...")
     # Add quoted text to embedding text
     tweets_df["emb_text"] = tweets_df["full_text"].apply(
         lambda x: f"[current] {clean_tweet_text(x)}"
     )
 
-    # Add quoted tweet text if available
-    for tweet_id, quoted_id in quote_map.items():
+    logger.info("Adding quoted tweet text to embedding text...")
+    # Create a mapping of tweet_id to index for faster lookups
+    tweet_id_to_idx = tweets_df.set_index("tweet_id")["emb_text"].to_dict()
+
+    # Process quotes in bulk
+    updates = {}
+    for tweet_id, quoted_id in tqdm(quote_map.items()):
         if quoted_id in quoted_tweets:
             quoted_text = clean_tweet_text(quoted_tweets[quoted_id]["full_text"])
         elif quoted_id in liked_quoted_tweets:
             quoted_text = clean_tweet_text(liked_quoted_tweets[quoted_id]["full_text"])
         else:
             quoted_text = ""
-        idx = tweets_df.index[tweets_df["tweet_id"] == tweet_id][0]
-        tweets_df.at[idx, "emb_text"] = (
-            f"[quoted] {quoted_text}\n{tweets_df.at[idx, 'emb_text']}"
+
+        if tweet_id in tweet_id_to_idx:
+            current_text = tweet_id_to_idx[tweet_id]
+            updates[tweet_id] = f"[quoted] {quoted_text}\n{current_text}"
+
+    # Bulk update the dataframe
+    tweets_df.loc[tweets_df["tweet_id"].isin(updates.keys()), "emb_text"] = (
+        tweets_df.loc[tweets_df["tweet_id"].isin(updates.keys()), "tweet_id"].map(
+            updates
         )
+    )
+
+    logger.info(f"Added text for {len(updates)} quoted tweets")
     return tweets_df, qts
 
 
