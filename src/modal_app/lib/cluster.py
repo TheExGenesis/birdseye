@@ -15,6 +15,7 @@ import pandas as pd
 import hdbscan
 from skopt import gp_minimize
 from skopt.space import Integer
+from tqdm import tqdm
 
 
 def _evaluate_clustering(
@@ -253,9 +254,19 @@ def find_optimal_clustering_params(
     print(f"max_cluster_size: {max_cluster_size}")
     print(f"min_min_samples: {min_min_samples}")
     print(f"max_min_samples: {max_min_samples}")
-    result = gp_minimize(
-        objective, space, x0=x0, n_calls=n_calls + len(x0), random_state=random_state
-    )
+    with tqdm(total=n_calls + len(x0), desc="Optimizing clustering params") as pbar:
+
+        def callback(res):
+            pbar.update(1)
+
+        result = gp_minimize(
+            objective,
+            space,
+            x0=x0,
+            n_calls=n_calls + len(x0),
+            random_state=random_state,
+            callback=callback,
+        )
 
     # If score is too low, retry with 'leaf' selection method
     if -result.fun < -2 and cluster_selection_method == "eom":
