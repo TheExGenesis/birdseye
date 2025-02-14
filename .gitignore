@@ -5,3 +5,5 @@ ca_pers_env/bin
 ca_pers_env/**/*
 .vscode
 .env
+src/node_modules
+scratchpads
