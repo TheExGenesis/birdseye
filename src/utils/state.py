@@ -7,14 +7,14 @@ DEFAULT_STATE = {
     "date_filter": None,
     "recompute_from": None,
     "show_bad_clusters": False,
-    "filter_replies": True,
-    "filter_retweets": True,
+    "filter_replies": False,
+    "filter_retweets": False,
     "cluster_sort_by": "Average Date",
     "cluster_prob_threshold": 0.3,
     "tweet_sort_by": "Favorite Count",
     "tweet_sort_ascending": False,
     "show_orphan_clusters": True,
-    "show_incomplete": False,
+    "show_incomplete": True,
 }
 
 

@@ -75,7 +75,7 @@ def fetch_users_with_profiles(account_ids: List[str]) -> Dict[str, Dict[str, Any
     }
 
 
-@st.cache_data(ttl=36000)
+@st.cache_data(ttl=36000, show_spinner=False)
 def fetch_tweets_with_images(tweet_ids: List[str]) -> Dict[str, List[str]]:
     """Fetch photo media_urls for given tweet IDs in batches of 500
 
@@ -85,12 +85,14 @@ def fetch_tweets_with_images(tweet_ids: List[str]) -> Dict[str, List[str]]:
     Returns:
         Dict mapping tweet_id to list of photo media_urls
     """
+    print(f"Fetching images for {len(tweet_ids)} tweets")
     supabase: Client = create_client(url, key)
     tweets_to_images = {}
 
     # Process in batches of 500
     for i in range(0, len(tweet_ids), 500):
         batch = tweet_ids[i : i + 500]
+        print(f"Processing batch {i//500 + 1} of {(len(tweet_ids) + 499)//500}")
 
         result = (
             supabase.table("tweet_media")
@@ -100,6 +102,8 @@ def fetch_tweets_with_images(tweet_ids: List[str]) -> Dict[str, List[str]]:
             .execute()
         )
 
+        print(f"Found {len(result.data)} images in batch")
+
         # Group media_urls by tweet_id
         for row in result.data:
             tweet_id = row["tweet_id"]
@@ -107,6 +111,7 @@ def fetch_tweets_with_images(tweet_ids: List[str]) -> Dict[str, List[str]]:
                 tweets_to_images[tweet_id] = []
             tweets_to_images[tweet_id].append(row["media_url"])
 
+    print(f"Total tweets with images: {len(tweets_to_images)}")
     return tweets_to_images
 
 
@@ -345,3 +350,96 @@ def get_default_user() -> Dict[str, Any]:
         "num_likes": 0,
         "profile": {"avatar_media_url": "", "archive_upload_id": 0},
     }
+
+
+@st.cache_data(ttl=36000)
+def prepare_topic_area_stats(
+    cluster_stats_df: pd.DataFrame, group_results: Dict[str, Any]
+) -> pd.DataFrame:
+    """Aggregate cluster stats by topic area and add ungrouped clusters"""
+    topic_areas = []
+    grouped_cluster_ids = set()  # Track all grouped cluster IDs
+
+    # Process existing groups
+    for group in group_results["groups"]:
+        member_ids = [member["id"] for member in group["members"]]
+        grouped_cluster_ids.update(member_ids)
+        member_stats = cluster_stats_df[cluster_stats_df["cluster_id"].isin(member_ids)]
+
+        if len(member_stats) > 0:
+            # Calculate weighted median date based on number of tweets
+            weighted_dates = []
+            for _, row in member_stats.iterrows():
+                weighted_dates.extend([row["median_date"]] * row["num_tweets"])
+            median_date = pd.Series(weighted_dates).median()
+
+            topic_area = {
+                "name": group["name"],
+                "description": unlink_markdown(group["summary"]),
+                "num_clusters": len(member_ids),
+                "num_tweets": member_stats["num_tweets"].sum(),
+                "total_likes": member_stats["total_likes"].sum(),
+                "median_likes": member_stats["median_likes"].median(),
+                "median_date": median_date,
+                "tweets_per_month": [
+                    sum(x)
+                    for x in zip(
+                        *[
+                            timeline if isinstance(timeline, list) else []
+                            for timeline in member_stats["tweets_per_month"]
+                        ]
+                    )
+                ],
+                "member_ids": member_ids,
+                "date_range": f"{member_stats['median_date'].min():%Y-%m} to {member_stats['median_date'].max():%Y-%m}",
+            }
+            topic_areas.append(topic_area)
+
+    # Add ungrouped clusters as a new topic area
+    ungrouped_ids = set(cluster_stats_df["cluster_id"]) - grouped_cluster_ids
+    if ungrouped_ids:
+        ungrouped_stats = cluster_stats_df[
+            cluster_stats_df["cluster_id"].isin(ungrouped_ids)
+        ]
+        if len(ungrouped_stats) > 0:
+            # Calculate weighted median date for ungrouped clusters
+            weighted_dates = []
+            for _, row in ungrouped_stats.iterrows():
+                weighted_dates.extend([row["median_date"]] * row["num_tweets"])
+            median_date = pd.Series(weighted_dates).median()
+
+            topic_areas.append(
+                {
+                    "name": "📦 Other Topics",
+                    "description": "Additional topics that don't fit into the main categories",
+                    "num_clusters": len(ungrouped_ids),
+                    "num_tweets": ungrouped_stats["num_tweets"].sum(),
+                    "total_likes": ungrouped_stats["total_likes"].sum(),
+                    "median_likes": ungrouped_stats["median_likes"].median(),
+                    "median_date": median_date,
+                    "tweets_per_month": [
+                        sum(x)
+                        for x in zip(
+                            *[
+                                timeline if isinstance(timeline, list) else []
+                                for timeline in ungrouped_stats["tweets_per_month"]
+                            ]
+                        )
+                    ],
+                    "member_ids": list(ungrouped_ids),
+                    "date_range": f"{ungrouped_stats['median_date'].min():%Y-%m} to {ungrouped_stats['median_date'].max():%Y-%m}",
+                }
+            )
+
+            # Add ungrouped section to group_results for consistent handling
+            group_results["groups"].append(
+                {
+                    "name": "📦 Other Topics",
+                    "summary": "Additional topics that don't fit into the main categories",
+                    "members": [
+                        {"id": id, "name": "Ungrouped"} for id in ungrouped_ids
+                    ],
+                }
+            )
+
+    return pd.DataFrame(topic_areas)

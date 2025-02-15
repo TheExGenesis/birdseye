@@ -30,7 +30,7 @@ from typing import Optional
 import hashlib
 
 # Setup
-st.set_page_config(layout="wide")
+st.set_page_config(page_title="🐦 Birdseye", page_icon="🐦", layout="wide")
 logging.basicConfig(level=logging.INFO)
 
 # Initialize session state
@@ -210,6 +210,7 @@ def render_loading_state(username: str, analysis_id: Optional[str] = None):
             "← Back to User Selection",
             on_click=back_to_user_selection,
             help="Select a different user",
+            key=f"loading_back_{username}",
         )
 
     # Try to get basic profile info even while loading
@@ -372,8 +373,11 @@ try:
             ]
         )
         # patch missing usernames in tweets_df
-        tweets_df["username"] = tweets_df["account_id"].map(
-            user_profiles_df.set_index("account_id")["username"]
+        tweets_df["username"] = (
+            tweets_df["account_id"]
+            .map(user_profiles_df.set_index("account_id")["username"])
+            .fillna("unknown")
+            .astype(str)
         )
         # st.write(user_profiles_df)
         # Render Profile Section
@@ -409,10 +413,10 @@ try:
                     "← Back to User Selection",
                     on_click=back_to_user_selection,
                     help="Select a different user",
+                    key=f"main_back_{username}",
                 )
 
             if user_profile:
-
                 centered_container(
                     lambda: render_profile(
                         user_profile, len(hierarchy_df[hierarchy_df["level"] == 0])
@@ -490,90 +494,98 @@ try:
                                     "cluster_id"
                                 ]
                             )
-                    else:
-                        print(
-                            f"empty row selection selected_cluster_id: {st.session_state['selected_cluster_id']}"
-                        )
-                        st.session_state["clicked_reference_tweets"] = set()
-                        if "clicked_refs" in st.query_params:
-                            del st.query_params["clicked_refs"]
-                            st.rerun()
+                    # elif not event.selection["rows"] and st.session_state.get(
+                    #     "selected_cluster_id"
+                    # ):
+                    #     # Clear selection
+                    #     st.session_state["selected_cluster_id"] = None
+                    #     if "cluster_id" in st.query_params:
+                    #         del st.query_params["cluster_id"]
+                    #     st.session_state["clicked_reference_tweets"] = set()
+                    #     # Add guard to prevent infinite loop
+                    #     if not st.session_state.get("clearing_selection"):
+                    #         st.session_state["clearing_selection"] = True
+                    #         st.rerun()
+                    #     else:
+                    #         del st.session_state["clearing_selection"]
 
-        if st.session_state["selected_cluster_id"]:
-            cluster_row = hierarchy_df[
-                hierarchy_df["cluster_id"] == st.session_state["selected_cluster_id"]
-            ].iloc[0]
-            st.session_state["cluster_ids"] = [
-                st.session_state["selected_cluster_id"]
-            ] + get_descendant_clusters(
-                st.session_state["selected_cluster_id"], clusters_by_parent
-            )
-            cluster_tweets = tweets_df[
-                tweets_df["cluster"].isin(st.session_state["cluster_ids"])
-            ]
-            # Create columns for side-by-side layout
-            with centered_container(lambda: st.container()):
-                stats_col, engaged_col, related_col = st.columns([2, 1, 1])
-
-                with related_col:
-                    # Find related clusters
-                    current_group = find_group_for_cluster(
-                        st.session_state["selected_cluster_id"], group_results["groups"]
-                    )
-                    if current_group:
-                        st.subheader(f"Related Clusters")
-                        related = get_related_clusters(
-                            st.session_state["selected_cluster_id"], current_group
-                        )
-                        for cluster in related:
-                            if st.button(
-                                hierarchy_df[
-                                    hierarchy_df["cluster_id"] == cluster["id"]
-                                ].iloc[0]["name"],
-                                key=f"related_cluster_{cluster['id']}",
-                                use_container_width=True,
-                            ):
-                                select_cluster(cluster["id"])
-
-                with stats_col:
-                    render_cluster_stats(cluster_row, cluster_tweets)
-
-                with engaged_col:
-                    render_engaged_users(
-                        st.session_state["selected_user"], cluster_tweets
-                    )
-
-        if st.session_state["selected_cluster_id"]:
-            yearly_summaries = ontology_items[st.session_state["selected_cluster_id"]][
-                "ontology_items"
-            ].get("yearly_summaries", [])
-            with centered_container(lambda: st.container()):
-                if yearly_summaries:
-                    render_yearly_summaries(yearly_summaries)
-                render_timeline_chart(cluster_tweets, tweets_df)
             if st.session_state["selected_cluster_id"]:
-                render_ontology_items(
-                    ontology_items[st.session_state["selected_cluster_id"]][
-                        "ontology_items"
-                    ],
-                    local_tweet_id_maps[st.session_state["selected_cluster_id"]],
+                cluster_row = hierarchy_df[
+                    hierarchy_df["cluster_id"]
+                    == st.session_state["selected_cluster_id"]
+                ].iloc[0]
+                st.session_state["cluster_ids"] = [
+                    st.session_state["selected_cluster_id"]
+                ] + get_descendant_clusters(
+                    st.session_state["selected_cluster_id"], clusters_by_parent
                 )
-            st.markdown("## Threads and Tweets:")
-            render_tweet_filters()
-            st.info(
-                "↔️ Scroll horizontally to see more tweet threads. Only the longest thread starting at each root is displayed."
-            )
+                cluster_tweets = tweets_df[
+                    tweets_df["cluster"].isin(st.session_state["cluster_ids"])
+                ]
+                # Create columns for side-by-side layout
+                with centered_container(lambda: st.container()):
+                    stats_col, engaged_col, related_col = st.columns([2, 1, 1])
 
-            render_tweet_threads(
-                tweets_df,
-                st.session_state["cluster_ids"],
-                user_profiles,
-                trees,
-                incomplete_trees,
-                username=st.session_state["selected_user"],
-                user_profiles_df=user_profiles_df,
-                qts=qts,
-            )
+                    with related_col:
+                        # Find related clusters
+                        current_group = find_group_for_cluster(
+                            st.session_state["selected_cluster_id"],
+                            group_results["groups"],
+                        )
+                        if current_group:
+                            st.subheader(f"Related Clusters")
+                            related = get_related_clusters(
+                                st.session_state["selected_cluster_id"], current_group
+                            )
+                            for cluster in related:
+                                if st.button(
+                                    hierarchy_df[
+                                        hierarchy_df["cluster_id"] == cluster["id"]
+                                    ].iloc[0]["name"],
+                                    key=f"related_cluster_{cluster['id']}",
+                                    use_container_width=True,
+                                ):
+                                    select_cluster(cluster["id"])
+
+                    with stats_col:
+                        render_cluster_stats(cluster_row, cluster_tweets)
+
+                    with engaged_col:
+                        render_engaged_users(
+                            st.session_state["selected_user"], cluster_tweets
+                        )
+
+            if st.session_state["selected_cluster_id"]:
+                yearly_summaries = ontology_items[
+                    st.session_state["selected_cluster_id"]
+                ]["ontology_items"].get("yearly_summaries", [])
+                with centered_container(lambda: st.container()):
+                    if yearly_summaries:
+                        render_yearly_summaries(yearly_summaries)
+                    render_timeline_chart(cluster_tweets, tweets_df)
+                if st.session_state["selected_cluster_id"]:
+                    render_ontology_items(
+                        ontology_items[st.session_state["selected_cluster_id"]][
+                            "ontology_items"
+                        ],
+                        local_tweet_id_maps[st.session_state["selected_cluster_id"]],
+                    )
+                st.markdown("## Threads and Tweets:")
+                render_tweet_filters()
+                st.info(
+                    "↔️ Scroll to see more tweet threads. Only the longest thread starting at each root is displayed."
+                )
+
+                render_tweet_threads(
+                    tweets_df,
+                    st.session_state["cluster_ids"],
+                    user_profiles,
+                    trees,
+                    incomplete_trees,
+                    username=st.session_state["selected_user"],
+                    user_profiles_df=user_profiles_df,
+                    qts=qts,
+                )
 
 except Exception as e:
     st.error(f"Error loading data: {e}")

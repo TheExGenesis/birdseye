@@ -1,4 +1,97 @@
 # %%
+
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+
+@dataclass
+class TweetReference:
+    tweet_id: str
+
+
+@dataclass
+class Entity:
+    id: str
+    name: str
+    description: str
+    tweet_references: List[str]
+
+
+@dataclass
+class BeliefValue:
+    id: str
+    belief: str
+    description: str
+    tweet_references: List[str]
+
+
+@dataclass
+class Goal:
+    id: str
+    goal: str
+    description: str
+    tweet_references: List[str]
+
+
+@dataclass
+class SocialRelationship:
+    id: str
+    username: str
+    interaction_type: str
+    tweet_references: List[str]
+
+
+@dataclass
+class MoodTone:
+    id: str
+    mood: str
+    description: str
+    tweet_references: List[str]
+
+
+@dataclass
+class KeyConcept:
+    id: str
+    concept: str
+    description: str
+    tweet_references: List[str]
+
+
+@dataclass
+class YearlySummary:
+    period: str
+    summary: str
+
+
+@dataclass
+class ClusterSummary:
+    name: str
+    summary: str
+
+
+@dataclass
+class OntologyItems:
+    entities: List[Entity]
+    beliefs_and_values: List[BeliefValue]
+    goals: List[Goal]
+    social_relationships: List[SocialRelationship]
+    moods_and_emotional_tones: List[MoodTone]
+    key_concepts_and_ideas: List[KeyConcept]
+    yearly_summaries: List[YearlySummary]
+
+
+@dataclass
+class ClusterOntology:
+    cluster_id: str
+    is_error: bool
+    message: str
+    ontology_items: OntologyItems
+    cluster_summary: ClusterSummary
+    low_quality_cluster: str
+
+
+ClusterOntologyDict = Dict[str, ClusterOntology]
+
 ontology = {
     "schema_info": "id should be unique singlie letters across all item types, starting from A. e.g.: entities will have ids A,B,C and beliefs_and_values will have ids D,E,F etc. tweet_references should be tweet ids, digits only.",
     "low_quality_cluster": {

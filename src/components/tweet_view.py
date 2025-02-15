@@ -195,47 +195,47 @@ def render_engaged_users(username, cluster_tweets):
         users_with_counts = [
             f"{user} ({count})" for user, count in top_reply_users.items()
         ]
-        st.subheader("Top engaged users: ")
+        st.subheader("Most replied to: ")
         st.markdown("\n".join([f"- {user}" for user in users_with_counts]))
     else:
-        st.subheader("Top engaged users: N/A")
+        st.subheader("Most replied to: N/A")
 
 
-@st.cache_data(ttl=60)
-def filter_and_sort_tweets(tweets_df, cluster_ids, sort_options, filters):
+@st.cache_data(ttl=60, show_spinner=False)
+def filter_and_sort_tweets(_tweets_df, cluster_ids, _sort_options, _filters):
     """Pre-compute filtered and sorted tweets, ensuring clicked tweets are included"""
     # First get clicked tweets if any exist
     clicked_tweets = []
     if "clicked_reference_tweets" in st.session_state:
-        clicked_tweets = tweets_df[
-            tweets_df["tweet_id"]
+        clicked_tweets = _tweets_df[
+            _tweets_df["tweet_id"]
             .astype(str)
             .isin(st.session_state["clicked_reference_tweets"])
         ].copy()
 
     # Filter remaining tweets as normal
-    filtered_df = tweets_df[tweets_df["cluster"].isin(cluster_ids)].copy()
+    filtered_df = _tweets_df[_tweets_df["cluster"].isin(cluster_ids)].copy()
 
-    if filters["filter_replies"]:
-        print(filters["selected_user"])
+    if _filters["filter_replies"]:
+        print(_filters["selected_user"])
         # print(filtered_df["username"])
         filtered_df = filtered_df[
             (
                 filtered_df["reply_to_username"].isna()
                 # | (filtered_df["reply_to_username"] == filters["selected_user"])
             )
-            & (filtered_df["username"].str.lower() == filters["selected_user"].lower())
+            & (filtered_df["username"].str.lower() == _filters["selected_user"].lower())
         ]
 
-    if filters["filter_retweets"]:
+    if _filters["filter_retweets"]:
         filtered_df = filtered_df[~filtered_df["full_text"].str.startswith("RT ")]
 
     filtered_df = filtered_df[
-        filtered_df["cluster_prob"] >= filters["cluster_prob_threshold"]
+        filtered_df["cluster_prob"] >= _filters["cluster_prob_threshold"]
     ]
 
-    if filters["date_filter"]:
-        start_date, end_date = filters["date_filter"]
+    if _filters["date_filter"]:
+        start_date, end_date = _filters["date_filter"]
         filtered_df = filtered_df[
             (filtered_df["created_at"] >= start_date)
             & (filtered_df["created_at"] <= end_date)
@@ -248,7 +248,7 @@ def filter_and_sort_tweets(tweets_df, cluster_ids, sort_options, filters):
         )
 
     return filtered_df.sort_values(
-        by=sort_options["field"], ascending=sort_options["ascending"]
+        by=_sort_options["field"], ascending=_sort_options["ascending"]
     )
 
 
@@ -446,13 +446,16 @@ def count_consecutive_self_tweets(thread_data, thread_tweets):
     if not thread_data:
         return 0
 
-    max_streak = current_streak = 0
     root_tweet = thread_tweets.get(thread_data[0], {})
-    root_user = root_tweet.get("username", "").lower()
+    root_user = str(root_tweet.get("username", "")).lower().strip() or "unknown"
+
+    max_streak = current_streak = 0
 
     for tweet_id in thread_data:
         tweet = thread_tweets.get(tweet_id, {})
-        if tweet.get("username", "").lower() == root_user:
+        tweet_user = str(tweet.get("username", "")).lower().strip() or "unknown"
+
+        if tweet_user == root_user:
             current_streak += 1
             max_streak = max(max_streak, current_streak)
         else:
@@ -552,11 +555,21 @@ def render_tweet_threads(
     st.markdown(
         """
         <style>
-        .st-key-thread_container .stHorizontalBlock {
-            display: flex !important;
-            flex-wrap: nowrap !important;
-            overflow-x: auto !important;
+        .thread-container {
+            max-width: 100vw;
+            overflow-x: auto;
+            padding-bottom: 1rem;
+        }
+        .thread-columns {
+            display: flex;
+            flex-wrap: nowrap;
             gap: 1rem;
+            padding: 0 1rem;
+        }
+        .thread-column {
+            flex: 0 0 400px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
             padding: 1rem;
         }
         
@@ -584,137 +597,183 @@ def render_tweet_threads(
         unsafe_allow_html=True,
     )
 
-    # Get filtered tweets
-    sort_options = {
-        "field": get_sort_options()["tweets"][st.session_state["tweet_sort_by"]],
-        "ascending": st.session_state["tweet_sort_ascending"],
-    }
-    print(f"sort_options: {sort_options}")
-    filters = {
-        "filter_replies": st.session_state["filter_replies"],
-        "filter_retweets": st.session_state["filter_retweets"],
-        "cluster_prob_threshold": st.session_state["cluster_prob_threshold"],
-        "date_filter": st.session_state["date_filter"],
-        "selected_user": st.session_state["selected_user"],
-    }
+    with st.container():
+        st.markdown(
+            '<div class="thread-container"><div class="thread-columns">',
+            unsafe_allow_html=True,
+        )
 
-    filtered_tweets = filter_and_sort_tweets(
-        tweets_df,
-        cluster_ids,
-        sort_options,
-        filters,
-    )
+        # Get filtered tweets
+        sort_options = {
+            "field": get_sort_options()["tweets"][st.session_state["tweet_sort_by"]],
+            "ascending": st.session_state["tweet_sort_ascending"],
+        }
+        print(f"sort_options: {sort_options}")
+        filters = {
+            "filter_replies": st.session_state["filter_replies"],
+            "filter_retweets": st.session_state["filter_retweets"],
+            "cluster_prob_threshold": st.session_state["cluster_prob_threshold"],
+            "date_filter": st.session_state["date_filter"],
+            "selected_user": st.session_state["selected_user"],
+        }
 
-    # Process both complete and incomplete trees
-    thread_dict, thread_tweets = tweet_df_to_threads(
-        filtered_tweets,
-        trees,
-        incomplete_trees,
-    )
+        filtered_tweets = filter_and_sort_tweets(
+            tweets_df,
+            cluster_ids,
+            sort_options,
+            filters,
+        )
 
-    tweets_with_images = fetch_tweets_with_images([t for t in thread_tweets.keys()])
+        # Process both complete and incomplete trees
+        thread_dict, thread_tweets = tweet_df_to_threads(
+            filtered_tweets,
+            trees,
+            incomplete_trees,
+        )
 
-    print(
-        f"clicked_reference_tweets: {st.session_state['clicked_reference_tweets']}, {len(set(st.session_state['clicked_reference_tweets']) & set(thread_tweets.keys()))}"
-    )
+        # Pass clicked tweets to order_threads_for_display
+        clicked_tweets = st.session_state.get("clicked_reference_tweets", set())
+        main_threads, other_threads = order_threads_for_display(
+            thread_dict,
+            thread_tweets,
+            sort_options,
+            clicked_tweets,
+        )
 
-    # Pass clicked tweets to order_threads_for_display
-    clicked_tweets = st.session_state.get("clicked_reference_tweets", set())
-    main_threads, other_threads = order_threads_for_display(
-        thread_dict,
-        thread_tweets,
-        sort_options,
-        clicked_tweets,
-    )
+        # Initialize lazy loading state per cluster
+        current_cluster = str(cluster_ids[0]) if cluster_ids else "global"
 
-    if st.session_state["clicked_reference_tweets"]:
-        if st.button(
-            f"Clear {len(clicked_tweets)} selected tweets",
-            key="clear_clicked_tweets",
+        # Check if loaded_chunks exists and is a dict, else initialize
+        if "loaded_chunks" not in st.session_state or not isinstance(
+            st.session_state.loaded_chunks, dict
         ):
-            del st.query_params["clicked_refs"]
-            st.session_state["clicked_reference_tweets"] = []
-            st.rerun()
+            st.session_state.loaded_chunks = {}
 
-    # Create container for horizontally scrolling threads
-    with st.container(key="thread_container"):
-        # Create a column for each thread
-        cols = st.columns(len(main_threads) or 1)
+        # Now handle current cluster
+        if current_cluster not in st.session_state.loaded_chunks:
+            st.session_state.loaded_chunks[current_cluster] = (
+                1  # Start with first chunk
+            )
 
-        # Render each thread in its own column
-        for (root_id, thread_data), col in zip(main_threads.items(), cols):
-            with col:
-                # Add visual indicator for incomplete threads
-                if any(
-                    path_id.startswith("incomplete_")
-                    for path_id in thread_dict
-                    if thread_data[0] in thread_dict[path_id]
-                ):
-                    st.warning("⚠️ Incomplete thread")
+        # Split threads into chunks of 20 for lazy loading
+        chunk_size = 20
+        all_threads = list(main_threads.items())
+        total_chunks = (len(all_threads) + chunk_size - 1) // chunk_size
 
-                # Get tweets in order of the path
-                for tweet_id in thread_data:
-                    if tweet_id in thread_tweets:
-                        tweet_data = thread_tweets[tweet_id]
+        # Only process visible chunks using cluster-specific count
+        loaded_chunks = st.session_state.loaded_chunks[current_cluster]
+        visible_threads = all_threads[: loaded_chunks * chunk_size]
 
-                        # Try to get user profile, create dummy if not found
-                        matching_profiles = user_profiles_df[
-                            user_profiles_df["account_id"] == tweet_data["account_id"]
-                        ]
-                        if len(matching_profiles) > 0:
-                            user_profile = matching_profiles.iloc[0]
-                        else:
-                            user_profile = pd.Series(
+        # Fetch images only for visible tweets
+        visible_tweet_ids = [
+            tweet_id for _, thread in visible_threads for tweet_id in thread
+        ]
+        tweets_with_images = fetch_tweets_with_images(visible_tweet_ids)
+
+        print(
+            f"clicked_reference_tweets: {st.session_state['clicked_reference_tweets']}, {len(set(st.session_state['clicked_reference_tweets']) & set(thread_tweets.keys()))}"
+        )
+
+        # Create container for horizontally scrolling threads
+        with st.container(key="thread_container"):
+            # Calculate total columns needed (visible threads + load more button if needed)
+            should_show_load_more = (
+                st.session_state.loaded_chunks[current_cluster] < total_chunks
+            )
+            num_columns = len(visible_threads) + (1 if should_show_load_more else 0)
+            cols = st.columns(max(num_columns, 1))  # Ensure at least 1 column
+
+            # Render each visible thread in its own column
+            for col_idx, (root_id, thread_data) in enumerate(visible_threads):
+                with cols[col_idx]:
+                    # Add visual indicator for incomplete threads
+                    if any(
+                        path_id.startswith("incomplete_")
+                        for path_id in thread_dict
+                        if thread_data[0] in thread_dict[path_id]
+                    ):
+                        st.warning("⚠️ Incomplete thread")
+
+                    # Get tweets in order of the path
+                    for tweet_id in thread_data:
+                        if tweet_id in thread_tweets:
+                            tweet_data = thread_tweets[tweet_id]
+
+                            # Try to get user profile, create dummy if not found
+                            matching_profiles = user_profiles_df[
+                                user_profiles_df["account_id"]
+                                == tweet_data["account_id"]
+                            ]
+                            if len(matching_profiles) > 0:
+                                user_profile = matching_profiles.iloc[0]
+                            else:
+                                user_profile = pd.Series(
+                                    {
+                                        "username": tweet_data.get(
+                                            "username", "unknown_user"
+                                        ),
+                                        "account_id": tweet_data["account_id"],
+                                        "avatar_media_url": None,
+                                    }
+                                )
+
+                            # Convert tweet data to match the format expected by render_tweet
+                            formatted_tweet = pd.Series(
                                 {
-                                    "username": tweet_data.get(
+                                    "tweet_id": tweet_data["tweet_id"],
+                                    "username": user_profile.get(
                                         "username", "unknown_user"
                                     ),
-                                    "account_id": tweet_data["account_id"],
-                                    "avatar_media_url": None,
+                                    "account_id": tweet_data.get("account_id", ""),
+                                    "full_text": tweet_data.get("full_text", ""),
+                                    "created_at": pd.to_datetime(
+                                        tweet_data.get("created_at")
+                                    ),
+                                    "favorite_count": tweet_data.get(
+                                        "favorite_count", 0
+                                    ),
+                                    "reply_to_username": tweet_data.get(
+                                        "in_reply_to_username"
+                                    ),
+                                    "cluster_prob": 1,  # These are definitely part of the thread
+                                    "avatar_media_url": user_profile.get(
+                                        "avatar_media_url"
+                                    ),
                                 }
                             )
-
-                        # Convert tweet data to match the format expected by render_tweet
-                        formatted_tweet = pd.Series(
-                            {
-                                "tweet_id": tweet_data["tweet_id"],
-                                "username": user_profile.get(
-                                    "username", "unknown_user"
-                                ),
-                                "account_id": tweet_data.get("account_id", ""),
-                                "full_text": tweet_data.get("full_text", ""),
-                                "created_at": pd.to_datetime(
-                                    tweet_data.get("created_at")
-                                ),
-                                "favorite_count": tweet_data.get("favorite_count", 0),
-                                "reply_to_username": tweet_data.get(
-                                    "in_reply_to_username"
-                                ),
-                                "cluster_prob": 1,  # These are definitely part of the thread
-                                "avatar_media_url": user_profile.get(
-                                    "avatar_media_url"
-                                ),
-                            }
-                        )
-                        quoted_tweet_id = qts["quote_map"].get(tweet_id, None)
-                        quoted_tweet = qts["quoted_tweets"].get(quoted_tweet_id, None)
-                        if quoted_tweet:
-                            quoted_profile_df = user_profiles_df[
-                                user_profiles_df["account_id"]
-                                == quoted_tweet["account_id"]
-                            ]
-                            quoted_tweet_profile = (
-                                quoted_profile_df.iloc[0]
-                                if len(quoted_profile_df) > 0
-                                else get_default_user()
+                            quoted_tweet_id = qts["quote_map"].get(tweet_id, None)
+                            quoted_tweet = qts["quoted_tweets"].get(
+                                quoted_tweet_id, None
                             )
-                        else:
-                            quoted_tweet_profile = None
+                            if quoted_tweet:
+                                quoted_profile_df = user_profiles_df[
+                                    user_profiles_df["account_id"]
+                                    == quoted_tweet["account_id"]
+                                ]
+                                quoted_tweet_profile = (
+                                    quoted_profile_df.iloc[0]
+                                    if len(quoted_profile_df) > 0
+                                    else get_default_user()
+                                )
+                            else:
+                                quoted_tweet_profile = None
 
-                        render_tweet(
-                            formatted_tweet,
-                            user_profile,
-                            tweets_with_images,
-                            quoted_tweet,
-                            quoted_tweet_profile,
-                        )
+                            render_tweet(
+                                formatted_tweet,
+                                user_profile,
+                                tweets_with_images,
+                                quoted_tweet,
+                                quoted_tweet_profile,
+                            )
+
+            # Add load more button in last column if needed
+            if should_show_load_more:
+                with cols[-1]:
+                    st.write("")  # Vertical spacer
+                    if st.button("⏩ Load more", key=f"load_more_{current_cluster}"):
+                        # Only increment for current cluster
+                        st.session_state.loaded_chunks[current_cluster] += 1
+                        # Use experimental_rerun to preserve component state
+                        st.rerun()
+
+        st.markdown("</div></div>", unsafe_allow_html=True)
