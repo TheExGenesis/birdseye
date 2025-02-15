@@ -103,7 +103,6 @@ else:
 # Configure GPU and model constants
 GPU_CONFIG = modal.gpu.T4()
 # MODEL_ID = "jxm/cde-small-v2"
-MODEL_ID = "BAAI/bge-base-en-v1.5"  # 60 texts/sec on infinity on T4 , w bettertransformer, batch size 32
 MODEL_ID = "dunzhang/stella_en_400M_v5"  # 56 texts/sec on infinity on T4 , w bettertransformer, batch size 32
 
 BATCH_SIZE = 32
@@ -286,7 +285,7 @@ class InfinityEmbedder:
 
     @modal.method()
     async def embed(self, inputs: list[str]):
-        logging.info(f"Embedding batch of {len(inputs)} texts")
+        # logging.info(f"Embedding batch of {len(inputs)} texts")
         start = time.time()
         engine = self.engine_array[0]
         embeddings, _ = await engine.embed(sentences=inputs)
@@ -1110,15 +1109,57 @@ def orchestrator(username: str, force_recompute: str = "none", stop_after: str =
         raise
 
 
+import logging
+from supabase import create_client
+
+
+def fetch_users():
+    logging.info("Executing fetch_users")
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    result = supabase.table("account").select("account_id", "username").execute()
+    return result.data
+
+
+def get_usernames_from_volume():
+    """Get list of usernames from twitter-archive-data volume that have completed processing"""
+    try:
+        volume = modal.Volume.lookup("twitter-archive-data")
+        # Get directory listing and extract usernames
+        entries = volume.listdir("/", recursive=True)
+        print(f"entries: {[entry.path for entry in entries]}")
+        # Filter for directories and check for cluster_ontology_items.json
+        usernames = []
+        for entry in entries:
+            if entry.path.endswith("cluster_ontology_items.json"):
+                usernames.append(entry.path.split("/")[0])
+        print(f"usernames: {usernames}")
+        return sorted(usernames)
+    except Exception as e:
+        print(f"Error accessing volume: {e}")
+        return []
+
+
 @app.local_entrypoint()
 def main():
-    usernames = ["sunriseoath"]
-    usernames = ["DRMacIver"]
-    usernames = ["silverarm0r"]
-    usernames = ["visakanv"]
-    for username in usernames:
-        print(f"\n\n\nProcessing {username}")
-        orchestrator.remote(username.lower())
+
+    volume_usernames = get_usernames_from_volume()
+    print(f"volume_usernames: {volume_usernames}")
+    archive_users = fetch_users()
+    archive_usernames = [u["username"] for u in archive_users]
+
+    usernames_not_in_volume = [
+        u
+        for u in archive_usernames
+        if u.lower() not in [u_.lower() for u_ in volume_usernames]
+    ]
+
+    for username in tqdm(usernames_not_in_volume, desc="Processing users"):
+        try:
+            print(f"\n\n\nProcessing {username}")
+            orchestrator.remote(username.lower())
+            print(f"Successfully processed {username}")
+        except Exception as e:
+            print(f"Error processing {username}: {e}")
 
 
 # %%

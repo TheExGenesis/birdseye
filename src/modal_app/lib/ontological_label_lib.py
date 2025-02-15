@@ -783,7 +783,7 @@ def label_one_cluster(
 ):
     """Labels a single cluster with error handling and retries"""
 
-    print(f"labeling {cluster_id}")
+    # print(f"labeling {cluster_id}")
     message = ONTOLOGY_LABEL_CLUSTER_PROMPT.format(
         ontology=ontology,
         tweet_texts=cluster_str,
@@ -800,6 +800,7 @@ def label_one_cluster(
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+
             print(f"LLM call for {cluster_id} took {time.time() - start_time:.2f}s")
 
         except Exception as e:
