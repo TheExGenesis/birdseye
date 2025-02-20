@@ -312,7 +312,7 @@ supabase: Client = create_client(url, key)
 # test supabase
 
 
-ANTHROPIC_API_KEY = "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"
+# ANTHROPIC_API_KEY =
 
 
 load_dotenv(
