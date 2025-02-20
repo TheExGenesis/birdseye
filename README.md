@@ -1,4 +1,4 @@
-# community-archive-personal
+# birdseye, for the community archive
 
 - `brew install pyenv`
   - `echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.zshrc`
